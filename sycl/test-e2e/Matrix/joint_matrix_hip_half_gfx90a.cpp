@@ -1,8 +1,17 @@
-// RUN: %{build} -fsycl -fsycl-targets=amd_gpu_gfx90a %s -o %t.out
+//===---joint_matrix_hip_half_gfx90a.cpp - DPC++ joint_matrix--------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: %clangxx -fsycl -fsycl-targets=amd_gpu_gfx90a %s -o %t.out
 // RUN: %{run} %t.out
 
-// REQUIRES: gpu-amd-gfx90a
+// REQUIRES: arch-amd_gpu_gfx90a
 // REQUIRES: aspect-fp16
+// REQUIRES: build-and-run-mode
 
 #include "joint_matrix_hip_apply.hpp"
 #include "joint_matrix_hip_copy.hpp"

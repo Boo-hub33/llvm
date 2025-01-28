@@ -12,6 +12,7 @@
 #include "llvm/SYCLLowerIR/DeviceGlobals.h"
 #include "llvm/SYCLLowerIR/ESIMD/ESIMDUtils.h"
 #include "llvm/SYCLLowerIR/HostPipes.h"
+#include "llvm/SYCLLowerIR/TargetHelpers.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringMap.h"
@@ -309,7 +310,7 @@ attributeToExecModeMetadata(const Attribute &Attr, Function &F) {
     return std::nullopt;
   StringRef AttrKindStr = Attr.getKindAsString();
   // Early exit if it is not a sycl-* attribute.
-  if (!AttrKindStr.startswith("sycl-"))
+  if (!AttrKindStr.starts_with("sycl-"))
     return std::nullopt;
 
   auto AddFPControlMetadataForWidth = [&](int32_t SPIRVFPControl,
@@ -361,18 +362,24 @@ attributeToExecModeMetadata(const Attribute &Attr, Function &F) {
       AddFPControlMetadataForWidth(SPIRV_DENORM_PRESERVE, 64);
   }
 
-  if (AttrKindStr == "sycl-work-group-size" ||
-      AttrKindStr == "sycl-work-group-size-hint") {
-    // Split values in the comma-separated list integers.
-    SmallVector<StringRef, 3> ValStrs;
-    Attr.getValueAsString().split(ValStrs, ',');
+  static constexpr std::tuple<const char *, const char *> SimpleWGAttrs[] = {
+      {"sycl-work-group-size", "reqd_work_group_size"},
+      {"sycl-work-group-size-hint", "work_group_size_hint"},
+      {"sycl-max-work-group-size", "max_work_group_size"},
+  };
 
-    assert(ValStrs.size() <= 3 &&
-           "sycl-work-group-size and sycl-work-group-size-hint currently only "
-           "support up to three values");
+  for (auto &[AttrKind, MDStr] : SimpleWGAttrs) {
+    if (AttrKindStr != AttrKind)
+      continue;
+    // Split values in the comma-separated list integers.
+    SmallVector<StringRef, 3> AttrValStrs;
+    Attr.getValueAsString().split(AttrValStrs, ',');
+
+    size_t NumDims = AttrValStrs.size();
+    assert(NumDims <= 3 && "Incorrect number of values for kernel property");
 
     // SYCL work-group sizes must be reversed for SPIR-V.
-    std::reverse(ValStrs.begin(), ValStrs.end());
+    std::reverse(AttrValStrs.begin(), AttrValStrs.end());
 
     // Use integer pointer size as closest analogue to size_t.
     IntegerType *IntPtrTy = DLayout.getIntPtrType(Ctx);
@@ -381,14 +388,21 @@ attributeToExecModeMetadata(const Attribute &Attr, Function &F) {
 
     // Get the integers from the strings.
     SmallVector<Metadata *, 3> MDVals;
-    for (StringRef ValStr : ValStrs)
+    for (StringRef ValStr : AttrValStrs)
       MDVals.push_back(ConstantAsMetadata::get(
           Constant::getIntegerValue(SizeTTy, APInt(SizeTBitSize, ValStr, 10))));
+    while (MDVals.size() < 3)
+      MDVals.push_back(ConstantAsMetadata::get(
+          Constant::getIntegerValue(SizeTTy, APInt(SizeTBitSize, 1, 10))));
 
-    const char *MDName = (AttrKindStr == "sycl-work-group-size")
-                             ? "reqd_work_group_size"
-                             : "work_group_size_hint";
-    return std::pair<std::string, MDNode *>(MDName, MDNode::get(Ctx, MDVals));
+    if (NumDims < 3) {
+      if (!F.hasMetadata("work_group_num_dim"))
+        F.setMetadata("work_group_num_dim",
+                      MDNode::get(Ctx, ConstantAsMetadata::get(ConstantInt::get(
+                                           Type::getInt32Ty(Ctx), NumDims))));
+    }
+
+    return std::pair<std::string, MDNode *>(MDStr, MDNode::get(Ctx, MDVals));
   }
 
   if (AttrKindStr == "sycl-sub-group-size") {
@@ -398,6 +412,21 @@ attributeToExecModeMetadata(const Attribute &Attr, Function &F) {
         Constant::getIntegerValue(Ty, APInt(32, SubGroupSize)));
     SmallVector<Metadata *, 1> MD{MDVal};
     return std::pair<std::string, MDNode *>("intel_reqd_sub_group_size",
+                                            MDNode::get(Ctx, MD));
+  }
+
+  if (AttrKindStr == "sycl-max-linear-work-group-size") {
+    auto MaxLinearSize = getAttributeAsInteger<uint64_t>(Attr);
+    // Use integer pointer size as closest analogue to size_t.
+    IntegerType *IntPtrTy = DLayout.getIntPtrType(Ctx);
+    IntegerType *SizeTTy = Type::getIntNTy(Ctx, IntPtrTy->getBitWidth());
+    unsigned SizeTBitSize = SizeTTy->getBitWidth();
+
+    // Get the integers from the strings.
+    Metadata *MD = ConstantAsMetadata::get(Constant::getIntegerValue(
+        SizeTTy, APInt(SizeTBitSize, MaxLinearSize, 10)));
+
+    return std::pair<std::string, MDNode *>("max_linear_work_group_size",
                                             MDNode::get(Ctx, MD));
   }
 
@@ -416,6 +445,7 @@ attributeToExecModeMetadata(const Attribute &Attr, Function &F) {
 
   if (AttrKindStr == "sycl-streaming-interface") {
     // generate either:
+    //   !ip_interface !N
     //   !N = !{!"streaming"} or
     //   !N = !{!"streaming", !"stall_free_return"}
     SmallVector<Metadata *, 2> MD;
@@ -428,6 +458,7 @@ attributeToExecModeMetadata(const Attribute &Attr, Function &F) {
 
   if (AttrKindStr == "sycl-register-map-interface") {
     // generate either:
+    //   !ip_interface !N
     //   !N = !{!"csr"} or
     //   !N = !{!"csr", !"wait_for_done_write"}
     SmallVector<Metadata *, 2> MD;
@@ -438,14 +469,30 @@ attributeToExecModeMetadata(const Attribute &Attr, Function &F) {
                                             MDNode::get(Ctx, MD));
   }
 
+  if (AttrKindStr == "sycl-fpga-cluster") {
+    // generate either:
+    //   !stall_free !N
+    //   !N = !{i32 1} or
+    //   !stall_enable !N
+    //   !N = !{i32 1}
+    std::string ClusterType =
+        getAttributeAsInteger<uint32_t>(Attr) ? "stall_enable" : "stall_free";
+    Metadata *ClusterMDArgs[] = {
+        ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Ctx), 1))};
+    return std::pair<std::string, MDNode *>(ClusterType,
+                                            MDNode::get(Ctx, ClusterMDArgs));
+  }
+
   if ((AttrKindStr == SYCL_REGISTER_ALLOC_MODE_ATTR ||
        AttrKindStr == SYCL_GRF_SIZE_ATTR) &&
       !llvm::esimd::isESIMD(F)) {
     // TODO: Remove SYCL_REGISTER_ALLOC_MODE_ATTR support in next ABI break.
     uint32_t PropVal = getAttributeAsInteger<uint32_t>(Attr);
     if (AttrKindStr == SYCL_GRF_SIZE_ATTR) {
-      assert((PropVal == 0 || PropVal == 128 || PropVal == 256) &&
-             "Unsupported GRF Size");
+      // The RegisterAllocMode metadata supports only 0, 128, and 256 for
+      // PropVal.
+      if (PropVal != 0 && PropVal != 128 && PropVal != 256)
+        return std::nullopt;
       // Map sycl-grf-size values to RegisterAllocMode values used in SPIR-V.
       static constexpr int SMALL_GRF_REGALLOCMODE_VAL = 1;
       static constexpr int LARGE_GRF_REGALLOCMODE_VAL = 2;
@@ -570,9 +617,13 @@ PreservedAnalyses CompileTimePropertiesPass::run(Module &M,
   }
 
   // Process all properties on kernels.
+  TargetHelpers::KernelCache HIPCUDAKCache;
+  HIPCUDAKCache.populateKernels(M);
+
   for (Function &F : M) {
     // Only consider kernels.
-    if (F.getCallingConv() != CallingConv::SPIR_KERNEL)
+    if (F.getCallingConv() != CallingConv::SPIR_KERNEL &&
+        !HIPCUDAKCache.isKernel(F))
       continue;
 
     // Compile time properties on kernel arguments
@@ -683,7 +734,7 @@ PreservedAnalyses CompileTimePropertiesPass::run(Module &M,
                                   : PreservedAnalyses::all();
 }
 
-void CompileTimePropertiesPass::parseAlignmentAndApply(
+bool CompileTimePropertiesPass::parseAlignmentAndApply(
     Module &M, IntrinsicInst *IntrInst) {
   // Get the global variable with the annotation string.
   const GlobalVariable *AnnotStrArgGV = nullptr;
@@ -693,11 +744,11 @@ void CompileTimePropertiesPass::parseAlignmentAndApply(
   else if (auto *GEP = dyn_cast<GEPOperator>(IntrAnnotStringArg))
     AnnotStrArgGV = dyn_cast<GlobalVariable>(GEP->getOperand(0));
   if (!AnnotStrArgGV)
-    return;
+    return false;
 
   std::optional<StringRef> AnnotStr = getGlobalVariableString(AnnotStrArgGV);
   if (!AnnotStr)
-    return;
+    return false;
 
   // parse properties string to decoration-value pairs
   auto Properties = parseSYCLPropertiesString(M, IntrInst);
@@ -708,6 +759,7 @@ void CompileTimePropertiesPass::parseAlignmentAndApply(
   getUserListIgnoringCast<StoreInst>(IntrInst, TargetedInstList);
   getUserListIgnoringCast<MemTransferInst>(IntrInst, TargetedInstList);
 
+  bool AlignApplied = false;
   for (auto &Property : Properties) {
     auto DecorStr = Property.first->str();
     auto DecorValue = Property.second;
@@ -731,18 +783,26 @@ void CompileTimePropertiesPass::parseAlignmentAndApply(
         auto Op_num = Pair.second;
         if (auto *LInst = dyn_cast<LoadInst>(Inst)) {
           LInst->setAlignment(Align_val);
+          AlignApplied = true;
         } else if (auto *SInst = dyn_cast<StoreInst>(Inst)) {
-          if (Op_num == 1)
+          if (Op_num == 1) {
             SInst->setAlignment(Align_val);
+            AlignApplied = true;
+          }
         } else if (auto *MI = dyn_cast<MemTransferInst>(Inst)) {
-          if (Op_num == 0)
+          if (Op_num == 0) {
             MI->setDestAlignment(Align_val);
-          else if (Op_num == 1)
+            AlignApplied = true;
+          } else if (Op_num == 1) {
             MI->setSourceAlignment(Align_val);
+            AlignApplied = true;
+          }
         }
       }
     }
   }
+
+  return AlignApplied;
 }
 
 // Returns true if the transformation changed IntrInst.
@@ -771,7 +831,7 @@ bool CompileTimePropertiesPass::transformSYCLPropertiesAnnotation(
     return false;
 
   // check alignment annotation and apply it to load/store
-  parseAlignmentAndApply(M, IntrInst);
+  bool AlignApplied = parseAlignmentAndApply(M, IntrInst);
 
   // Read the annotation values and create new annotation strings.
   std::string NewAnnotString = "";
@@ -780,9 +840,9 @@ bool CompileTimePropertiesPass::transformSYCLPropertiesAnnotation(
   bool CacheProp = false;
   bool FPGAProp = false;
   for (const auto &[PropName, PropVal] : Properties) {
-    // sycl-alignment is converted to align on
-    // previous parseAlignmentAndApply(), dropping here
-    if (PropName == "sycl-alignment")
+    // if sycl-alignment is converted to align on IR constructs
+    // during parseAlignmentAndApply(), dropping here
+    if (PropName == "sycl-alignment" && AlignApplied)
       continue;
 
     auto DecorIt = SpirvDecorMap.find(*PropName);

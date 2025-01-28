@@ -16,7 +16,7 @@
 
 namespace mlir {
 namespace LLVM {
-#define GEN_PASS_DEF_DISCOPEFORLLVMFUNCOP
+#define GEN_PASS_DEF_DISCOPEFORLLVMFUNCOPPASS
 #include "mlir/Dialect/LLVMIR/Transforms/Passes.h.inc"
 } // namespace LLVM
 } // namespace mlir
@@ -65,32 +65,39 @@ static void addScopeToFunction(LLVM::LLVMFuncOp llvmFunc,
   auto subroutineTypeAttr =
       LLVM::DISubroutineTypeAttr::get(context, llvm::dwarf::DW_CC_normal, {});
 
-  StringAttr funcNameAttr = llvmFunc.getNameAttr();
   // Only definitions need a distinct identifier and a compilation unit.
-  mlir::DistinctAttr id;
-  if (!llvmFunc.isExternal())
+  DistinctAttr id;
+  auto subprogramFlags = LLVM::DISubprogramFlags::Optimized;
+  if (!llvmFunc.isExternal()) {
     id = mlir::DistinctAttr::create(mlir::UnitAttr::get(context));
-  else
+    subprogramFlags = subprogramFlags | LLVM::DISubprogramFlags::Definition;
+  } else {
     compileUnitAttr = {};
-  mlir::LLVM::DISubprogramAttr subprogramAttr = LLVM::DISubprogramAttr::get(
-      context, id, compileUnitAttr, fileAttr, funcNameAttr, funcNameAttr,
-      fileAttr,
-      /*line=*/line,
-      /*scopeline=*/col,
-      LLVM::DISubprogramFlags::Definition | LLVM::DISubprogramFlags::Optimized,
-      subroutineTypeAttr);
+  }
+  auto funcName = StringAttr::get(context, llvmFunc.getName());
+  auto subprogramAttr = LLVM::DISubprogramAttr::get(
+      context, id, compileUnitAttr, fileAttr, funcName, funcName, fileAttr,
+      /*line=*/line, /*scopeline=*/col, subprogramFlags, subroutineTypeAttr,
+      /*retainedNodes=*/{}, /*annotations=*/{});
   llvmFunc->setLoc(FusedLoc::get(context, {loc}, subprogramAttr));
 }
 
 namespace {
 /// Add a debug info scope to LLVMFuncOp that are missing it.
-struct DIScopeForLLVMFuncOp
-    : public LLVM::impl::DIScopeForLLVMFuncOpBase<DIScopeForLLVMFuncOp> {
+struct DIScopeForLLVMFuncOpPass
+    : public LLVM::impl::DIScopeForLLVMFuncOpPassBase<
+          DIScopeForLLVMFuncOpPass> {
+  using Base::Base;
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
     Location loc = module.getLoc();
 
     MLIRContext *context = &getContext();
+    if (!context->getLoadedDialect<LLVM::LLVMDialect>()) {
+      emitError(loc, "LLVM dialect is not loaded.");
+      return signalPassFailure();
+    }
 
     // To find a DICompileUnitAttr attached to a parent (the module for
     // example), otherwise create a default one.
@@ -114,9 +121,9 @@ struct DIScopeForLLVMFuncOp
       }
 
       compileUnitAttr = LLVM::DICompileUnitAttr::get(
-          context, DistinctAttr::create(UnitAttr::get(context)),
-          llvm::dwarf::DW_LANG_C, fileAttr, StringAttr::get(context, "MLIR"),
-          /*isOptimized=*/true, LLVM::DIEmissionKind::LineTablesOnly);
+          DistinctAttr::create(UnitAttr::get(context)), llvm::dwarf::DW_LANG_C,
+          fileAttr, StringAttr::get(context, "MLIR"),
+          /*isOptimized=*/true, emissionKind);
     }
 
     // Create subprograms for each function with the same distinct compile unit.
@@ -127,7 +134,3 @@ struct DIScopeForLLVMFuncOp
 };
 
 } // end anonymous namespace
-
-std::unique_ptr<Pass> mlir::LLVM::createDIScopeForLLVMFuncOpPass() {
-  return std::make_unique<DIScopeForLLVMFuncOp>();
-}

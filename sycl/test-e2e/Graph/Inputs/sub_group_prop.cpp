@@ -1,6 +1,7 @@
 // This test is adapted from "test-e2e/Basic/sub_group_size_prop.cpp"
 
 #include "../graph_common.hpp"
+#include <sycl/sub_group.hpp>
 
 enum class Variant { Function, Functor, FunctorAndProperty };
 
@@ -141,11 +142,7 @@ void test(queue &Queue, const std::vector<size_t> SupportedSGSizes) {
 }
 
 int main() {
-  queue Queue({sycl::ext::intel::property::queue::no_immediate_command_list{}});
-
-  if (!are_graphs_supported(Queue)) {
-    return 0;
-  }
+  queue Queue;
 
   std::vector<size_t> SupportedSGSizes =
       Queue.get_device().get_info<info::device::sub_group_sizes>();

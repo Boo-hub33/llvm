@@ -1,4 +1,4 @@
-//===- TableGen.cpp - Top-Level TableGen implementation for Clang ---------===//
+//===-- TableGen.cpp - Top-Level TableGen implementation for Clang --------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -10,13 +10,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "TableGenBackends.h" // Declares all backends.
 #include "ASTTableGen.h"
+#include "TableGenBackends.h" // Declares all backends.
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Signals.h"
-#include "llvm/TableGen/Error.h"
 #include "llvm/TableGen/Main.h"
 #include "llvm/TableGen/Record.h"
 
@@ -31,13 +30,11 @@ enum ActionType {
   GenClangAttrSubjectMatchRulesParserStringSwitches,
   GenClangAttrImpl,
   GenClangAttrList,
-  GenClangAttrCanPrintLeftList,
-  GenClangAttrMustPrintLeftList,
   GenClangAttrDocTable,
   GenClangAttrSubjectMatchRuleList,
   GenClangAttrPCHRead,
   GenClangAttrPCHWrite,
-  GenClangAttrTokenKinds,
+  GenClangRegularKeywordAttributeInfo,
   GenClangAttrHasAttributeImpl,
   GenClangAttrSpellingListIndex,
   GenClangAttrASTVisitor,
@@ -49,6 +46,7 @@ enum ActionType {
   GenClangAttrNodeTraverse,
   GenClangBasicReader,
   GenClangBasicWriter,
+  GenClangBuiltins,
   GenClangDiagsDefs,
   GenClangDiagGroups,
   GenClangDiagsIndexName,
@@ -77,6 +75,7 @@ enum ActionType {
   GenArmVectorType,
   GenArmNeonSema,
   GenArmNeonTest,
+  GenArmImmCheckTypes,
   GenArmMveHeader,
   GenArmMveBuiltinDef,
   GenArmMveBuiltinSema,
@@ -134,14 +133,6 @@ cl::opt<ActionType> Action(
                    "Generate clang attribute implementations"),
         clEnumValN(GenClangAttrList, "gen-clang-attr-list",
                    "Generate a clang attribute list"),
-        clEnumValN(GenClangAttrCanPrintLeftList,
-                   "gen-clang-attr-can-print-left-list",
-                   "Generate list of attributes that can be printed on left "
-                   "side of a decl"),
-        clEnumValN(GenClangAttrMustPrintLeftList,
-                   "gen-clang-attr-must-print-left-list",
-                   "Generate list of attributes that must be printed on left "
-                   "side of a decl"),
         clEnumValN(GenClangAttrDocTable, "gen-clang-attr-doc-table",
                    "Generate a table of attribute documentation"),
         clEnumValN(GenClangAttrSubjectMatchRuleList,
@@ -151,8 +142,10 @@ cl::opt<ActionType> Action(
                    "Generate clang PCH attribute reader"),
         clEnumValN(GenClangAttrPCHWrite, "gen-clang-attr-pch-write",
                    "Generate clang PCH attribute writer"),
-        clEnumValN(GenClangAttrTokenKinds, "gen-clang-attr-token-kinds",
-                   "Generate a list of attribute-related clang tokens"),
+        clEnumValN(GenClangRegularKeywordAttributeInfo,
+                   "gen-clang-regular-keyword-attr-info",
+                   "Generate a list of regular keyword attributes with info "
+                   "about their arguments"),
         clEnumValN(GenClangAttrHasAttributeImpl,
                    "gen-clang-attr-has-attribute-impl",
                    "Generate a clang attribute spelling list"),
@@ -177,6 +170,8 @@ cl::opt<ActionType> Action(
                    "Generate clang attribute text node dumper"),
         clEnumValN(GenClangAttrNodeTraverse, "gen-clang-attr-node-traverse",
                    "Generate clang attribute traverser"),
+        clEnumValN(GenClangBuiltins, "gen-clang-builtins",
+                   "Generate clang builtins list"),
         clEnumValN(GenClangDiagsDefs, "gen-clang-diags-defs",
                    "Generate Clang diagnostics definitions"),
         clEnumValN(GenClangDiagGroups, "gen-clang-diag-groups",
@@ -242,6 +237,10 @@ cl::opt<ActionType> Action(
                    "Generate ARM NEON sema support for clang"),
         clEnumValN(GenArmNeonTest, "gen-arm-neon-test",
                    "Generate ARM NEON tests for clang"),
+        clEnumValN(
+            GenArmImmCheckTypes, "gen-arm-immcheck-types",
+            "Generate arm_immcheck_types.inc (immediate range check types)"
+            " for clang"),
         clEnumValN(GenArmSveHeader, "gen-arm-sve-header",
                    "Generate arm_sve.h for clang"),
         clEnumValN(GenArmSveBuiltins, "gen-arm-sve-builtins",
@@ -294,11 +293,14 @@ cl::opt<ActionType> Action(
                    "Generate riscv_vector_builtin_cg.inc for clang"),
         clEnumValN(GenRISCVVectorBuiltinSema, "gen-riscv-vector-builtin-sema",
                    "Generate riscv_vector_builtin_sema.inc for clang"),
-        clEnumValN(GenRISCVSiFiveVectorBuiltins, "gen-riscv-sifive-vector-builtins",
+        clEnumValN(GenRISCVSiFiveVectorBuiltins,
+                   "gen-riscv-sifive-vector-builtins",
                    "Generate riscv_sifive_vector_builtins.inc for clang"),
-        clEnumValN(GenRISCVSiFiveVectorBuiltinCG, "gen-riscv-sifive-vector-builtin-codegen",
+        clEnumValN(GenRISCVSiFiveVectorBuiltinCG,
+                   "gen-riscv-sifive-vector-builtin-codegen",
                    "Generate riscv_sifive_vector_builtin_cg.inc for clang"),
-        clEnumValN(GenRISCVSiFiveVectorBuiltinSema, "gen-riscv-sifive-vector-builtin-sema",
+        clEnumValN(GenRISCVSiFiveVectorBuiltinSema,
+                   "gen-riscv-sifive-vector-builtin-sema",
                    "Generate riscv_sifive_vector_builtin_sema.inc for clang"),
         clEnumValN(GenAttrDocs, "gen-attr-docs",
                    "Generate attribute documentation"),
@@ -317,7 +319,7 @@ ClangComponent("clang-component",
                cl::desc("Only use warnings from specified component"),
                cl::value_desc("component"), cl::Hidden);
 
-bool ClangTableGenMain(raw_ostream &OS, RecordKeeper &Records) {
+bool ClangTableGenMain(raw_ostream &OS, const RecordKeeper &Records) {
   switch (Action) {
   case PrintRecords:
     OS << Records;           // No argument, dump all contents
@@ -340,12 +342,6 @@ bool ClangTableGenMain(raw_ostream &OS, RecordKeeper &Records) {
   case GenClangAttrList:
     EmitClangAttrList(Records, OS);
     break;
-  case GenClangAttrCanPrintLeftList:
-    EmitClangAttrPrintList("CanPrintOnLeft", Records, OS);
-    break;
-  case GenClangAttrMustPrintLeftList:
-    EmitClangAttrPrintList("PrintOnLeft", Records, OS);
-    break;
   case GenClangAttrDocTable:
     EmitClangAttrDocTable(Records, OS);
     break;
@@ -358,8 +354,8 @@ bool ClangTableGenMain(raw_ostream &OS, RecordKeeper &Records) {
   case GenClangAttrPCHWrite:
     EmitClangAttrPCHWrite(Records, OS);
     break;
-  case GenClangAttrTokenKinds:
-    EmitClangAttrTokenKinds(Records, OS);
+  case GenClangRegularKeywordAttributeInfo:
+    EmitClangRegularKeywordAttributeInfo(Records, OS);
     break;
   case GenClangAttrHasAttributeImpl:
     EmitClangAttrHasAttrImpl(Records, OS);
@@ -387,6 +383,9 @@ bool ClangTableGenMain(raw_ostream &OS, RecordKeeper &Records) {
     break;
   case GenClangAttrNodeTraverse:
     EmitClangAttrNodeTraverse(Records, OS);
+    break;
+  case GenClangBuiltins:
+    EmitClangBuiltins(Records, OS);
     break;
   case GenClangDiagsDefs:
     EmitClangDiagsDefs(Records, OS, ClangComponent);
@@ -479,6 +478,9 @@ bool ClangTableGenMain(raw_ostream &OS, RecordKeeper &Records) {
     break;
   case GenArmNeonTest:
     EmitNeonTest(Records, OS);
+    break;
+  case GenArmImmCheckTypes:
+    EmitImmCheckTypes(Records, OS);
     break;
   case GenArmMveHeader:
     EmitMveHeader(Records, OS);

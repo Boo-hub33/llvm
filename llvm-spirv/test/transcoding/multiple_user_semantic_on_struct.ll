@@ -37,6 +37,17 @@
 ; RUN: llvm-as %s -o %t.bc
 ; RUN: llvm-spirv %t.bc --spirv-ext=+SPV_INTEL_fpga_memory_accesses,+SPV_INTEL_fpga_memory_attributes -spirv-text -o - | FileCheck %s --check-prefix=CHECK-SPIRV
 
+; Check the same with untyped pointers enabled
+; RUN: llvm-spirv --spirv-ext=+SPV_KHR_untyped_pointers %t.bc -spirv-text -o - | FileCheck %s --check-prefix=CHECK-SPIRV
+; RUN: llvm-spirv --spirv-ext=+SPV_KHR_untyped_pointers %t.bc -o %t.spv
+; RUN: llvm-spirv -r %t.spv -o %t.rev.bc
+; RUN: llvm-dis < %t.rev.bc | FileCheck %s --check-prefix=CHECK-LLVM
+
+; Check that even when FPGA memory extensions are enabled - yet we have
+; UserSemantic decoration be generated
+; RUN: llvm-as %s -o %t.bc
+; RUN: llvm-spirv %t.bc --spirv-ext=+SPV_INTEL_fpga_memory_accesses,+SPV_INTEL_fpga_memory_attributes,+SPV_KHR_untyped_pointers -spirv-text -o - | FileCheck %s --check-prefix=CHECK-SPIRV
+
 ; CHECK-SPIRV: Decorate [[#GEP1:]] UserSemantic "ClassA"
 ; CHECK-SPIRV: Decorate [[#GEP2:]] UserSemantic "ClassA"
 ; CHECK-SPIRV: Decorate [[#GEP3:]] UserSemantic "Dec1"
@@ -45,12 +56,12 @@
 ; CHECK-SPIRV: Decorate [[#GEP4:]] UserSemantic "ClassAfieldB"
 ; CHECK-SPIRV: Decorate [[#GEP5:]] UserSemantic "ClassB"
 ; CHECK-SPIRV: Decorate [[#GEP6:]] UserSemantic "ClassB"
-; CHECK-SPIRV: InBoundsPtrAccessChain [[#]] [[#GEP1]] [[#]]
-; CHECK-SPIRV: InBoundsPtrAccessChain [[#]] [[#GEP2]] [[#]]
-; CHECK-SPIRV: InBoundsPtrAccessChain [[#]] [[#GEP3]] [[#]]
-; CHECK-SPIRV: InBoundsPtrAccessChain [[#]] [[#GEP4]] [[#]]
-; CHECK-SPIRV: InBoundsPtrAccessChain [[#]] [[#GEP5]] [[#]]
-; CHECK-SPIRV: InBoundsPtrAccessChain [[#]] [[#GEP6]] [[#]]
+; CHECK-SPIRV: {{(InBoundsPtrAccessChain|UntypedInBoundsPtrAccessChainKHR)}} [[#]] [[#GEP1]] [[#]]
+; CHECK-SPIRV: {{(InBoundsPtrAccessChain|UntypedInBoundsPtrAccessChainKHR)}} [[#]] [[#GEP2]] [[#]]
+; CHECK-SPIRV: {{(InBoundsPtrAccessChain|UntypedInBoundsPtrAccessChainKHR)}} [[#]] [[#GEP3]] [[#]]
+; CHECK-SPIRV: {{(InBoundsPtrAccessChain|UntypedInBoundsPtrAccessChainKHR)}} [[#]] [[#GEP4]] [[#]]
+; CHECK-SPIRV: {{(InBoundsPtrAccessChain|UntypedInBoundsPtrAccessChainKHR)}} [[#]] [[#GEP5]] [[#]]
+; CHECK-SPIRV: {{(InBoundsPtrAccessChain|UntypedInBoundsPtrAccessChainKHR)}} [[#]] [[#GEP6]] [[#]]
 
 target datalayout = "e-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-n8:16:32:64"
 target triple = "spir64"
@@ -108,9 +119,9 @@ define dso_local noundef i32 @main() #0 {
   ; CHECK-LLVM: %[[#GepMultiDec:]] = getelementptr inbounds %class.A, ptr %[[#ObjClassA]], i32 0, i32 1
   ; CHECK-LLVM: %[[#PtrAnnMultiDec:]] = call ptr @llvm.ptr.annotation{{.*}}(ptr %[[#GepMultiDec]], ptr @[[#Dec1]]
   ; CHECK-LLVM: %[[#PtrAnn2MultiDec:]] = call ptr @llvm.ptr.annotation{{.*}}(ptr %[[#PtrAnnMultiDec]], ptr @[[#Dec2]]
-  ; CHECK-LLVM: %[[#PtrAnn3MultiDec:]] = call ptr @llvm.ptr.annotation{{.*}}(ptr %[[#PtrAnnMultiDec]], ptr @[[#Dec3]]
+  ; CHECK-LLVM: %[[#PtrAnn3MultiDec:]] = call ptr @llvm.ptr.annotation{{.*}}(ptr %[[#PtrAnn2MultiDec]], ptr @[[#Dec3]]
   %15 = load i32, ptr %14, align 4
-  ; CHECK-LLVM: %[[#LoadMultiDec:]] = bitcast ptr %[[#PtrAnnMultiDec]] to ptr
+  ; CHECK-LLVM: %[[#LoadMultiDec:]] = bitcast ptr %[[#PtrAnn3MultiDec]] to ptr
   ; CHECK-LLVM: %[[#LoadMultiDec2:]] = bitcast ptr %[[#LoadMultiDec]] to ptr
   ; CHECK-LLVM: %[[#CallClassAMultiDec:]] = load i32, ptr %[[#LoadMultiDec2]], align 4
   call void @_Z3fooi(i32 noundef %15)
@@ -120,7 +131,7 @@ define dso_local noundef i32 @main() #0 {
   ; CHECK-LLVM: %[[#PtrAnnClassAFieldB:]] = call ptr @llvm.ptr.annotation{{.*}}(ptr %[[#GepClassAFieldB]], ptr @[[#StrAfieldB]]
   %18 = getelementptr inbounds %class.B, ptr %17, i32 0, i32 0
   %19 = call ptr @llvm.ptr.annotation.p0.p1(ptr %18, ptr addrspace(1) @.str.6, ptr addrspace(1) @.str.1, i32 5, ptr addrspace(1) null)
-  ; CHECK-LLVM: %[[#CastGepClassAFieldB:]] = bitcast ptr %[[#GepClassAFieldB]] to ptr
+  ; CHECK-LLVM: %[[#CastGepClassAFieldB:]] = bitcast ptr %[[#PtrAnnClassAFieldB]] to ptr
   ; CHECK-LLVM: %[[#CastGepClassAFieldB2:]] = bitcast ptr %[[#CastGepClassAFieldB]] to ptr
   ; CHECK-LLVM: %[[#GEPClassB:]] = getelementptr inbounds %class.B, ptr %[[#CastGepClassAFieldB2]], i32 0, i32 0
   ; CHECK-LLVM: %[[#PtrAnnClassB:]] = call ptr @llvm.ptr.annotation{{.*}}(ptr %[[#GEPClassB]], ptr @[[#StrStructB]]
