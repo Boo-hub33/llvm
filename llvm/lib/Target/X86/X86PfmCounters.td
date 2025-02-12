@@ -19,7 +19,13 @@ def : PfmCountersDefaultBinding<DefaultPfmCounters>;
 
 // Intel X86 Counters.
 defvar DefaultIntelPfmValidationCounters = [
-  PfmValidationCounter<InstructionRetired, "INSTRUCTIONS_RETIRED">
+  PfmValidationCounter<InstructionRetired, "INSTRUCTIONS_RETIRED">,
+  PfmValidationCounter<L1DCacheLoadMiss, "MEM_LOAD_UOPS_RETIRED:L1_MISS">,
+  PfmValidationCounter<L1ICacheLoadMiss, "L1-ICACHE-LOAD-MISSES">,
+  PfmValidationCounter<DataTLBLoadMiss, "DTLB_LOAD_MISSES:MISS_CAUSES_A_WALK">,
+  PfmValidationCounter<DataTLBStoreMiss, "DTLB_STORE_MISSES:MISS_CAUSES_A_WALK">,
+  PfmValidationCounter<InstructionTLBLoadMiss, "ITLB_MISSES:MISS_CAUSES_A_WALK">,
+  PfmValidationCounter<BranchPredictionMiss, "BRANCH-MISSES">
 ];
 
 def PentiumPfmCounters : ProcPfmCounters {
@@ -183,13 +189,13 @@ def IceLakePfmCounters : ProcPfmCounters {
   let CycleCounter = UnhaltedCoreCyclesPfmCounter;
   let UopsCounter = UopsIssuedPfmCounter;
   let IssueCounters = [
-    PfmIssueCounter<"ICXPort0",  "uops_dispatched_port:port_0">,
-    PfmIssueCounter<"ICXPort1",  "uops_dispatched_port:port_1">,
-    PfmIssueCounter<"ICXPort23", "uops_dispatched_port:port_2_3">,
-    PfmIssueCounter<"ICXPort49", "uops_dispatched_port:port_4_9">,
-    PfmIssueCounter<"ICXPort5",  "uops_dispatched_port:port_5">,
-    PfmIssueCounter<"ICXPort6",  "uops_dispatched_port:port_6">,
-    PfmIssueCounter<"ICXPort78", "uops_dispatched_port:port_7_8">
+    PfmIssueCounter<"ICXPort0",  "uops_dispatched:port_0">,
+    PfmIssueCounter<"ICXPort1",  "uops_dispatched:port_1">,
+    PfmIssueCounter<"ICXPort23", "uops_dispatched:port_2_3">,
+    PfmIssueCounter<"ICXPort49", "uops_dispatched:port_4_9">,
+    PfmIssueCounter<"ICXPort5",  "uops_dispatched:port_5">,
+    PfmIssueCounter<"ICXPort6",  "uops_dispatched:port_6">,
+    PfmIssueCounter<"ICXPort78", "uops_dispatched:port_7_8">
   ];
   let ValidationCounters = DefaultIntelPfmValidationCounters;
 }
@@ -198,9 +204,47 @@ def : PfmCountersBinding<"icelake-server", IceLakePfmCounters>;
 def : PfmCountersBinding<"rocketlake", IceLakePfmCounters>;
 def : PfmCountersBinding<"tigerlake", IceLakePfmCounters>;
 
+def AlderLakePfmCounters : ProcPfmCounters {
+  let CycleCounter = UnhaltedCoreCyclesPfmCounter;
+  let UopsCounter = UopsIssuedPfmCounter;
+  let IssueCounters = [
+    PfmIssueCounter<"ADLPPort00", "uops_dispatched:port_0">,
+    PfmIssueCounter<"ADLPPort01", "uops_dispatched:port_1">,
+    PfmIssueCounter<"ADLPPort02_03_10", "uops_dispatched:port_2_3_10">,
+    PfmIssueCounter<"ADLPPort04_09", "uops_dispatched:port_4_9">,
+    PfmIssueCounter<"ADLPPort05_11", "uops_dispatched:port_5_11">,
+    PfmIssueCounter<"ADLPPort06", "uops_dispatched:port_6">,
+    PfmIssueCounter<"ADLPPort07_08", "uops_dispatched:port_7_8">
+  ];
+  let ValidationCounters = DefaultIntelPfmValidationCounters;
+}
+def : PfmCountersBinding<"alderlake", AlderLakePfmCounters>;
+
+def SapphireRapidsPfmCounters : ProcPfmCounters {
+  let CycleCounter = UnhaltedCoreCyclesPfmCounter;
+  let UopsCounter = UopsIssuedPfmCounter;
+  let IssueCounters = [
+    PfmIssueCounter<"SPRPort00", "uops_dispatched:port_0">,
+    PfmIssueCounter<"SPRPort01", "uops_dispatched:port_1">,
+    PfmIssueCounter<"SPRPort02_03_10", "uops_dispatched:port_2_3_10">,
+    PfmIssueCounter<"SPRPort04_09", "uops_dispatched:port_4_9">,
+    PfmIssueCounter<"SPRPort05_11", "uops_dispatched:port_5_11">,
+    PfmIssueCounter<"SPRPort06", "uops_dispatched:port_6">,
+    PfmIssueCounter<"SPRPort07_08", "uops_dispatched:port_7_8">,
+  ];
+  let ValidationCounters = DefaultIntelPfmValidationCounters;
+}
+def : PfmCountersBinding<"sapphirerapids", SapphireRapidsPfmCounters>;
+
 // AMD X86 Counters.
 defvar DefaultAMDPfmValidationCounters = [
-  PfmValidationCounter<InstructionRetired, "RETIRED_INSTRUCTIONS">
+  PfmValidationCounter<InstructionRetired, "RETIRED_INSTRUCTIONS">,
+  PfmValidationCounter<L1DCacheLoadMiss, "L1-DCACHE-LOAD-MISSES">,
+  PfmValidationCounter<L1DCacheStoreMiss, "L1-DCACHE-STORE-MISSES">,
+  PfmValidationCounter<L1ICacheLoadMiss, "L1-ICACHE-LOAD-MISSES">,
+  PfmValidationCounter<DataTLBLoadMiss, "DTLB-LOAD-MISSES">,
+  PfmValidationCounter<InstructionTLBLoadMiss, "ITLB-LOAD-MISSES">,
+  PfmValidationCounter<BranchPredictionMiss, "BRANCH-MISSES">
 ];
 
 // Set basic counters for AMD cpus that we know libpfm4 supports.
@@ -322,3 +366,4 @@ def ZnVer4PfmCounters : ProcPfmCounters {
   let ValidationCounters = DefaultAMDPfmValidationCounters;
 }
 def : PfmCountersBinding<"znver4", ZnVer4PfmCounters>;
+def : PfmCountersBinding<"znver5", ZnVer4PfmCounters>;

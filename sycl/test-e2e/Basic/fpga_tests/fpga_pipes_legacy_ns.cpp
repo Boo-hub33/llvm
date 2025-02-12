@@ -1,4 +1,4 @@
-// REQUIRES: accelerator
+// REQUIRES: target-spir, accelerator
 // RUN: %{build} -o %t.out
 // RUN: %{run} %t.out
 //==-------- fpga_pipes_legacy_ns.cpp - SYCL FPGA pipes test ---------------==//
@@ -9,7 +9,8 @@
 //
 //===----------------------------------------------------------------------===//
 #include <iostream>
-#include <sycl/sycl.hpp>
+#include <sycl/detail/core.hpp>
+#include <sycl/pipes.hpp>
 
 class some_nb_pipe;
 

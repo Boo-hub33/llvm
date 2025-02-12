@@ -21,7 +21,7 @@
 == Notice
 
 [%hardbreaks]
-Copyright (C) 2023-2023 Intel Corporation.  All rights reserved.
+Copyright (C) 2023 Intel Corporation.  All rights reserved.
 
 Khronos(R) is a registered trademark and SYCL(TM) and SPIR(TM) are trademarks
 of The Khronos Group Inc.
@@ -187,8 +187,8 @@ kernel_bundle<bundle_state::ext_oneapi_source> create_kernel_bundle_from_source(
 !====
 
 _Preconditions:_ There are two overloads of this function: one that reads the
-source code of the kernel from an `std::string`, and one that reads the source
-code of the kernel from an `std::vector` of `std::byte`.
+source code of the kernel from a `std::string`, and one that reads the source
+code of the kernel from a `std::vector` of `std::byte`.
 Each source language `lang` specifies whether the language is text format or
 binary format, and the application must use the overload that corresponds to
 that format.
@@ -311,9 +311,6 @@ struct build_options {
 };
 using build_options_key = build_options;
 
-template<>
-struct is_property_key<build_options_key> : std::true_type {};
-
 } // namespace sycl::ext::oneapi::experimental
 ----
 !====
@@ -344,9 +341,6 @@ struct save_log {
   save_log(std::string *to);  (1)
 };
 using save_log_key = save_log;
-
-template<>
-struct is_property_key<save_log_key> : std::true_type {};
 
 } // namespace sycl::ext::oneapi::experimental
 ----

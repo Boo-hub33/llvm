@@ -57,6 +57,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/TypedPointerType.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -92,6 +93,24 @@ void addFnAttr(CallInst *Call, Attribute::AttrKind Attr) {
 
 void removeFnAttr(CallInst *Call, Attribute::AttrKind Attr) {
   Call->removeFnAttr(Attr);
+}
+
+Value *extendVector(Value *V, FixedVectorType *NewType,
+                    IRBuilderBase &Builder) {
+  unsigned OldSize = cast<FixedVectorType>(V->getType())->getNumElements();
+  unsigned NewSize = NewType->getNumElements();
+  assert(OldSize < NewSize);
+  std::vector<Constant *> Components;
+  IntegerType *Int32Ty = Builder.getInt32Ty();
+  for (unsigned I = 0; I < NewSize; I++) {
+    if (I < OldSize)
+      Components.push_back(ConstantInt::get(Int32Ty, I));
+    else
+      Components.push_back(PoisonValue::get(Int32Ty));
+  }
+
+  return Builder.CreateShuffleVector(V, PoisonValue::get(V->getType()),
+                                     ConstantVector::get(Components), "vecext");
 }
 
 void saveLLVMModule(Module *M, const std::string &OutputFile) {
@@ -167,7 +186,7 @@ StructType *getOrCreateOpaqueStructType(Module *M, StringRef Name) {
 }
 
 void getFunctionTypeParameterTypes(llvm::FunctionType *FT,
-                                   std::vector<Type *> &ArgTys) {
+                                   SmallVector<Type *> &ArgTys) {
   for (auto I = FT->param_begin(), E = FT->param_end(); I != E; ++I) {
     ArgTys.push_back(*I);
   }
@@ -423,7 +442,7 @@ bool getSPIRVBuiltin(const std::string &OrigName, spv::BuiltIn &B) {
 // if true is returned
 bool oclIsBuiltin(StringRef Name, StringRef &DemangledName, bool IsCpp) {
   if (Name == "printf") {
-    DemangledName = Name;
+    DemangledName = "__spirv_ocl_printf";
     return true;
   }
   if (isNonMangledOCLBuiltin(Name)) {
@@ -787,8 +806,11 @@ bool getParameterTypes(Function *F, SmallVectorImpl<Type *> &ArgTys,
       HasSret = true;
       unsigned AS = Arg.getType()->getPointerAddressSpace();
       if (auto *STy = dyn_cast<StructType>(Ty))
-        ArgTys.push_back(
-            TypedPointerType::get(GetStructType(STy->getName()), AS));
+        if (STy->hasName())
+          ArgTys.push_back(
+              TypedPointerType::get(GetStructType(STy->getName()), AS));
+        else
+          ArgTys.push_back(TypedPointerType::get(STy, AS));
       else
         ArgTys.push_back(TypedPointerType::get(Ty, AS));
     } else {
@@ -871,6 +893,45 @@ bool getParameterTypes(Function *F, SmallVectorImpl<Type *> &ArgTys,
   return DemangledSuccessfully;
 }
 
+bool getRetParamSignedness(Function *F, ParamSignedness &RetSignedness,
+                           SmallVectorImpl<ParamSignedness> &ArgSignedness) {
+  using namespace llvm::itanium_demangle;
+  StringRef Name = F->getName();
+  if (!Name.starts_with("_Z") || F->arg_empty())
+    return false;
+
+  ManglingParser<DefaultAllocator> Demangler(Name.begin(), Name.end());
+  // If it's not a function name encoding, bail out.
+  auto *RootNode = dyn_cast_or_null<FunctionEncoding>(Demangler.parse());
+  if (!RootNode)
+    return false;
+
+  auto GetSignedness = [](const itanium_demangle::Node *N) {
+    if (!N)
+      return ParamSignedness::Unknown;
+    if (const auto *Vec = dyn_cast<itanium_demangle::VectorType>(N))
+      N = Vec->getBaseType();
+    if (const auto *Name = dyn_cast<NameType>(N)) {
+      StringRef Arg(stringify(Name));
+      if (Arg.starts_with("unsigned"))
+        return ParamSignedness::Unsigned;
+      if (Arg == "char" || Arg == "short" || Arg == "int" || Arg == "long")
+        return ParamSignedness::Signed;
+    }
+    return ParamSignedness::Unknown;
+  };
+  RetSignedness = GetSignedness(RootNode->getReturnType());
+  ArgSignedness.resize(F->arg_size());
+  for (const auto &[I, ParamType] : llvm::enumerate(RootNode->getParams())) {
+    if (F->getArg(I)->getType()->isIntOrIntVectorTy())
+      ArgSignedness[I] = GetSignedness(ParamType);
+    else
+      ArgSignedness[I] = ParamSignedness::Unknown;
+  }
+
+  return true;
+}
+
 CallInst *mutateCallInst(
     Module *M, CallInst *CI,
     std::function<std::string(CallInst *, std::vector<Value *> &)> ArgMutate,
@@ -885,7 +946,7 @@ CallInst *mutateCallInst(
     CI->setName(InstName + ".old");
   }
   auto *NewCI = addCallInst(M, NewName, CI->getType(), Args, Attrs, CI, Mangle,
-                           InstName, TakeFuncName);
+                            InstName, TakeFuncName);
   NewCI->setDebugLoc(CI->getDebugLoc());
   LLVM_DEBUG(dbgs() << " => " << *NewCI << '\n');
   CI->replaceAllUsesWith(NewCI);
@@ -905,8 +966,8 @@ Instruction *mutateCallInst(
   Type *RetTy = CI->getType();
   auto NewName = ArgMutate(CI, Args, RetTy);
   StringRef InstName = CI->getName();
-  auto *NewCI = addCallInst(M, NewName, RetTy, Args, Attrs, CI, Mangle, InstName,
-                           TakeFuncName);
+  auto *NewCI = addCallInst(M, NewName, RetTy, Args, Attrs, CI, Mangle,
+                            InstName, TakeFuncName);
   auto *NewI = RetMutate(NewCI);
   NewI->takeName(CI);
   NewI->setDebugLoc(CI->getDebugLoc());
@@ -951,9 +1012,13 @@ CallInst *addCallInst(Module *M, StringRef FuncName, Type *RetTy,
                       StringRef InstName, bool TakeFuncName) {
 
   auto *F = getOrCreateFunction(M, RetTy, getTypes(Args), FuncName, Mangle,
-                               Attrs, TakeFuncName);
+                                Attrs, TakeFuncName);
+  InsertPosition InsertPos(nullptr);
+  if (Pos)
+    InsertPos = Pos->getIterator();
   // Cannot assign a Name to void typed values
-  auto *CI = CallInst::Create(F, Args, RetTy->isVoidTy() ? "" : InstName, Pos);
+  auto *CI =
+      CallInst::Create(F, Args, RetTy->isVoidTy() ? "" : InstName, InsertPos);
   CI->setCallingConv(F->getCallingConv());
   CI->setAttributes(F->getAttributes());
   return CI;
@@ -1002,7 +1067,7 @@ PointerType *getInt8PtrTy(PointerType *T) {
   return PointerType::get(T->getContext(), T->getAddressSpace());
 }
 
-Value *castToInt8Ptr(Value *V, Instruction *Pos) {
+Value *castToInt8Ptr(Value *V, BasicBlock::iterator Pos) {
   return CastInst::CreatePointerCast(
       V, getInt8PtrTy(cast<PointerType>(V->getType())), "", Pos);
 }
@@ -1214,7 +1279,8 @@ SPIR::TypePrimitiveEnum getOCLTypePrimitiveEnum(StringRef TyName) {
 /// \param Signed indicates integer type should be translated as signed.
 /// \param VoidPtr indicates i8* should be translated as void*.
 static SPIR::RefParamType transTypeDesc(Type *Ty,
-                                        const BuiltinArgTypeMangleInfo &Info) {
+                                        const BuiltinArgTypeMangleInfo &Info,
+                                        StringRef InstName = "") {
   bool Signed = Info.IsSigned;
   unsigned Attr = Info.Attr;
   bool VoidPtr = Info.IsVoidPtr;
@@ -1323,8 +1389,14 @@ static SPIR::RefParamType transTypeDesc(Type *Ty,
     auto *ET = TPT->getElementType();
     SPIR::ParamType *EPT = nullptr;
     if (isa<FunctionType>(ET)) {
-      assert(isVoidFuncTy(cast<FunctionType>(ET)) && "Not supported");
-      EPT = new SPIR::BlockType;
+      FunctionType *FT = cast<FunctionType>(ET);
+      if (InstName.consume_front(kSPIRVName::Prefix) &&
+          InstName.starts_with("TaskSequence")) {
+        EPT = new SPIR::PointerType(transTypeDesc(FT->getReturnType(), Info));
+      } else {
+        assert((isVoidFuncTy(FT)) && "Not supported");
+        EPT = new SPIR::BlockType;
+      }
     } else if (auto *StructTy = dyn_cast<StructType>(ET)) {
       LLVM_DEBUG(dbgs() << "ptr to struct: " << *Ty << '\n');
       auto TyName = StructTy->getStructName();
@@ -1387,7 +1459,7 @@ static SPIR::RefParamType transTypeDesc(Type *Ty,
   return SPIR::RefParamType(new SPIR::PrimitiveType(SPIR::PRIMITIVE_INT));
 }
 
-Value *getScalarOrArray(Value *V, unsigned Size, Instruction *Pos) {
+Value *getScalarOrArray(Value *V, unsigned Size, BasicBlock::iterator Pos) {
   if (!V->getType()->isPointerTy())
     return V;
   Type *SourceTy;
@@ -1426,8 +1498,8 @@ Constant *getScalarOrVectorConstantInt(Type *T, uint64_t V, bool IsSigned) {
   return nullptr;
 }
 
-Value *getScalarOrArrayConstantInt(Instruction *Pos, Type *T, unsigned Len,
-                                   uint64_t V, bool IsSigned) {
+Value *getScalarOrArrayConstantInt(BasicBlock::iterator Pos, Type *T,
+                                   unsigned Len, uint64_t V, bool IsSigned) {
   if (auto *IT = dyn_cast<IntegerType>(T)) {
     assert(Len == 1 && "Invalid length");
     return ConstantInt::get(IT, V, IsSigned);
@@ -1498,6 +1570,9 @@ Type *getLLVMTypeForSPIRVImageSampledTypePostfix(StringRef Postfix,
   if (Postfix == kSPIRVImageSampledTypeName::Int ||
       Postfix == kSPIRVImageSampledTypeName::UInt)
     return Type::getInt32Ty(Ctx);
+  if (Postfix == kSPIRVImageSampledTypeName::Long ||
+      Postfix == kSPIRVImageSampledTypeName::ULong)
+    return Type::getInt64Ty(Ctx);
   llvm_unreachable("Invalid sampled type postfix");
   return nullptr;
 }
@@ -1652,7 +1727,7 @@ std::string mangleBuiltin(StringRef UniqName, ArrayRef<Type *> ArgTypes,
         T = MangleInfo.PointerTy;
       }
       FD.Parameters.emplace_back(
-          transTypeDesc(T, BtnInfo->getTypeMangleInfo(I)));
+          transTypeDesc(T, BtnInfo->getTypeMangleInfo(I), UniqName));
     }
   }
   // Ellipsis must be the last argument of any function
@@ -1777,9 +1852,14 @@ std::string decodeSPIRVTypeName(StringRef Name,
 // Returns true if type(s) and number of elements (if vector) is valid
 bool checkTypeForSPIRVExtendedInstLowering(IntrinsicInst *II, SPIRVModule *BM) {
   switch (II->getIntrinsicID()) {
+  case Intrinsic::acos:
+  case Intrinsic::asin:
+  case Intrinsic::atan:
+  case Intrinsic::atan2:
   case Intrinsic::ceil:
   case Intrinsic::copysign:
   case Intrinsic::cos:
+  case Intrinsic::cosh:
   case Intrinsic::exp:
   case Intrinsic::exp2:
   case Intrinsic::fabs:
@@ -1799,7 +1879,10 @@ bool checkTypeForSPIRVExtendedInstLowering(IntrinsicInst *II, SPIRVModule *BM) {
   case Intrinsic::round:
   case Intrinsic::roundeven:
   case Intrinsic::sin:
+  case Intrinsic::sinh:
   case Intrinsic::sqrt:
+  case Intrinsic::tan:
+  case Intrinsic::tanh:
   case Intrinsic::trunc: {
     // Although some of the intrinsics above take multiple arguments, it is
     // sufficient to check arg 0 because the LLVM Verifier will have checked
@@ -1816,8 +1899,8 @@ bool checkTypeForSPIRVExtendedInstLowering(IntrinsicInst *II, SPIRVModule *BM) {
     if ((!Ty->isFloatTy() && !Ty->isDoubleTy() && !Ty->isHalfTy()) ||
         (!BM->hasCapability(CapabilityVectorAnyINTEL) &&
          ((NumElems > 4) && (NumElems != 8) && (NumElems != 16)))) {
-      BM->SPIRVCK(
-          false, InvalidFunctionCall, II->getCalledOperand()->getName().str());
+      BM->SPIRVCK(false, InvalidFunctionCall,
+                  II->getCalledOperand()->getName().str());
       return false;
     }
     break;
@@ -1832,8 +1915,8 @@ bool checkTypeForSPIRVExtendedInstLowering(IntrinsicInst *II, SPIRVModule *BM) {
     if ((!Ty->isIntegerTy()) ||
         (!BM->hasCapability(CapabilityVectorAnyINTEL) &&
          ((NumElems > 4) && (NumElems != 8) && (NumElems != 16)))) {
-      BM->SPIRVCK(
-          false, InvalidFunctionCall, II->getCalledOperand()->getName().str());
+      BM->SPIRVCK(false, InvalidFunctionCall,
+                  II->getCalledOperand()->getName().str());
     }
     break;
   }
@@ -1880,7 +1963,7 @@ bool isSPIRVBuiltinVariable(GlobalVariable *GV,
 // %d = extractelement <3 x i64> %b, i32 idx
 // With:
 // %0 = call spir_func i64 @_Z13get_global_idj(i32 0) #1
-// %1 = insertelement <3 x i64> undef, i64 %0, i32 0
+// %1 = insertelement <3 x i64> poison, i64 %0, i32 0
 // %2 = call spir_func i64 @_Z13get_global_idj(i32 1) #1
 // %3 = insertelement <3 x i64> %1, i64 %2, i32 1
 // %4 = call spir_func i64 @_Z13get_global_idj(i32 2) #1
@@ -1895,7 +1978,7 @@ bool isSPIRVBuiltinVariable(GlobalVariable *GV,
 // %2 = load i64, i64 addrspace(4)* %1, align 32
 // With:
 // %0 = call spir_func i64 @_Z13get_global_idj(i32 0) #1
-// %1 = insertelement <3 x i64> undef, i64 %0, i32 0
+// %1 = insertelement <3 x i64> poison, i64 %0, i32 0
 // %2 = call spir_func i64 @_Z13get_global_idj(i32 1) #1
 // %3 = insertelement <3 x i64> %1, i64 %2, i32 1
 // %4 = call spir_func i64 @_Z13get_global_idj(i32 2) #1
@@ -1915,13 +1998,14 @@ static void replaceUsesOfBuiltinVar(Value *V, const APInt &AccumulatedOffset,
     if (auto *Cast = dyn_cast<CastInst>(U)) {
       replaceUsesOfBuiltinVar(Cast, AccumulatedOffset, ReplacementFunc, GV);
       InstsToRemove.push_back(Cast);
-    } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+    } else if (auto *GEP = dyn_cast<GEPOperator>(U)) {
       APInt NewOffset = AccumulatedOffset.sextOrTrunc(
           DL.getIndexSizeInBits(GEP->getPointerAddressSpace()));
       if (!GEP->accumulateConstantOffset(DL, NewOffset))
         llvm_unreachable("Illegal GEP of a SPIR-V builtin variable");
       replaceUsesOfBuiltinVar(GEP, NewOffset, ReplacementFunc, GV);
-      InstsToRemove.push_back(GEP);
+      if (auto *AsInst = dyn_cast<Instruction>(U))
+        InstsToRemove.push_back(AsInst);
     } else if (auto *Load = dyn_cast<LoadInst>(U)) {
       // Figure out which index the accumulated offset corresponds to. If we
       // have a weird offset (e.g., trying to load byte 7), bail out.
@@ -1950,7 +2034,7 @@ static void replaceUsesOfBuiltinVar(Value *V, const APInt &AccumulatedOffset,
           if (!Index.isZero() || DL.getTypeSizeInBits(VecTy) !=
                                      DL.getTypeSizeInBits(Load->getType()))
             llvm_unreachable("Illegal use of a SPIR-V builtin variable");
-          Replacement = UndefValue::get(VecTy);
+          Replacement = PoisonValue::get(VecTy);
           for (unsigned I = 0; I < VecTy->getNumElements(); I++) {
             Replacement = Builder.CreateInsertElement(
                 Replacement,
@@ -2077,20 +2161,37 @@ bool lowerBuiltinCallsToVariables(Module *M) {
     bool IsVec = F.getFunctionType()->getNumParams() > 0;
     Type *GVType =
         IsVec ? FixedVectorType::get(F.getReturnType(), 3) : F.getReturnType();
-    auto *BV = new GlobalVariable(
-        *M, GVType, /*isConstant=*/true, GlobalValue::ExternalLinkage, nullptr,
-        BuiltinVarName, 0, GlobalVariable::NotThreadLocal, SPIRAS_Input);
+    GlobalVariable *BV = nullptr;
+    // Consider the following LLVM IR:
+    // @__spirv_BuiltInLocalInvocationId = <Global constant>
+    // .....
+    // define spir_kernel void @kernel1(....) {
+    //   %3 = tail call i64 @_Z12get_local_idj(i32 0)
+    //   .....
+    //   return void
+    // }
+    // During the OCLToSPIRV pass, the opencl call will get lowered to
+    // yet another global variable with the name
+    // '@__spirv_BuiltInLocalInvocationId'. In such a case, we would want to
+    // create only a single global variable with this name.
+    if (GlobalVariable *GV = M->getGlobalVariable(BuiltinVarName))
+      BV = GV;
+    else
+      BV = new GlobalVariable(*M, GVType, /*isConstant=*/true,
+                              GlobalValue::ExternalLinkage, nullptr,
+                              BuiltinVarName, 0, GlobalVariable::NotThreadLocal,
+                              SPIRAS_Input);
     for (auto *U : F.users()) {
       auto *CI = dyn_cast<CallInst>(U);
       assert(CI && "invalid instruction");
       const DebugLoc &DLoc = CI->getDebugLoc();
-      Instruction *NewValue = new LoadInst(GVType, BV, "", CI);
+      Instruction *NewValue = new LoadInst(GVType, BV, "", CI->getIterator());
       if (DLoc)
         NewValue->setDebugLoc(DLoc);
       LLVM_DEBUG(dbgs() << "Transform: " << *CI << " => " << *NewValue << '\n');
       if (IsVec) {
-        NewValue =
-            ExtractElementInst::Create(NewValue, CI->getArgOperand(0), "", CI);
+        NewValue = ExtractElementInst::Create(NewValue, CI->getArgOperand(0),
+                                              "", CI->getIterator());
         if (DLoc)
           NewValue->setDebugLoc(DLoc);
         LLVM_DEBUG(dbgs() << *NewValue << '\n');
@@ -2129,11 +2230,24 @@ bool postProcessBuiltinReturningStruct(Function *F) {
   SmallVector<Instruction *, 32> InstToRemove;
   for (auto *U : F->users()) {
     if (auto *CI = dyn_cast<CallInst>(U)) {
-      auto *ST = cast<StoreInst>(*(CI->user_begin()));
-      std::vector<Type *> ArgTys;
+      IRBuilder<> Builder(CI->getParent());
+      Builder.SetInsertPoint(CI);
+      SmallVector<User *> Users(CI->users());
+      Value *A = nullptr;
+      StoreInst *SI = nullptr;
+      for (auto *U : Users) {
+        if ((SI = dyn_cast<StoreInst>(U)) != nullptr) {
+          A = SI->getPointerOperand();
+          InstToRemove.push_back(SI);
+          break;
+        }
+      }
+      if (!A) {
+        A = Builder.CreateAlloca(F->getReturnType());
+      }
+      SmallVector<Type *> ArgTys;
       getFunctionTypeParameterTypes(F->getFunctionType(), ArgTys);
-      ArgTys.insert(ArgTys.begin(),
-                    PointerType::get(F->getReturnType(), SPIRAS_Private));
+      ArgTys.insert(ArgTys.begin(), A->getType());
       auto *NewF =
           getOrCreateFunction(M, Type::getVoidTy(*Context), ArgTys, Name);
       auto SretAttr = Attribute::get(*Context, Attribute::AttrKind::StructRet,
@@ -2141,11 +2255,19 @@ bool postProcessBuiltinReturningStruct(Function *F) {
       NewF->addParamAttr(0, SretAttr);
       NewF->setCallingConv(F->getCallingConv());
       auto Args = getArguments(CI);
-      Args.insert(Args.begin(), ST->getPointerOperand());
-      auto *NewCI = CallInst::Create(NewF, Args, CI->getName(), CI);
+      Args.insert(Args.begin(), A);
+      CallInst *NewCI = Builder.CreateCall(NewF, Args, CI->getName());
       NewCI->addParamAttr(0, SretAttr);
       NewCI->setCallingConv(CI->getCallingConv());
-      InstToRemove.push_back(ST);
+      SmallVector<User *, 32> UsersToReplace;
+      for (auto *U : Users)
+        if (U != SI)
+          UsersToReplace.push_back(U);
+      if (UsersToReplace.size() > 0) {
+        auto *LI = Builder.CreateLoad(F->getReturnType(), A);
+        for (auto *U : UsersToReplace)
+          U->replaceUsesOfWith(CI, LI);
+      }
       InstToRemove.push_back(CI);
     }
   }
@@ -2172,12 +2294,13 @@ bool postProcessBuiltinWithArrayArguments(Function *F,
           auto *T = I->getType();
           if (!T->isArrayTy())
             continue;
-          auto *Alloca = new AllocaInst(T, 0, "", &(*FBegin));
-          new StoreInst(I, Alloca, false, CI);
+          auto *Alloca = new AllocaInst(T, 0, "", FBegin);
+          new StoreInst(I, Alloca, false, CI->getIterator());
           auto *Zero =
               ConstantInt::getNullValue(Type::getInt32Ty(T->getContext()));
           Value *Index[] = {Zero, Zero};
-          I = GetElementPtrInst::CreateInBounds(T, Alloca, Index, "", CI);
+          I = GetElementPtrInst::CreateInBounds(T, Alloca, Index, "",
+                                                CI->getIterator());
         }
         return Name.str();
       },
@@ -2228,7 +2351,7 @@ public:
 
   void init(StringRef UniqUnmangledName) override {
     UnmangledName = UniqUnmangledName.str();
-    switch (OC) {
+    switch (static_cast<unsigned>(OC)) {
     case OpConvertUToF:
     case OpUConvert:
     case OpSatConvertUToS:
@@ -2393,6 +2516,11 @@ public:
       }
       break;
     }
+    case internal::OpConvertHandleToImageINTEL:
+    case internal::OpConvertHandleToSamplerINTEL:
+    case internal::OpConvertHandleToSampledImageINTEL:
+      addUnsignedArg(0);
+      break;
     default:;
       // No special handling is needed
     }

@@ -49,8 +49,8 @@ private:
   };
 
   std::vector<UsingDeclContext> Contexts;
+  llvm::SmallPtrSet<const Decl *, 32> UsingTargetDeclsCache;
 
-  StringRef RawStringHeaderFileExtensions;
   FileExtensionsSet HeaderFileExtensions;
 };
 
