@@ -1,5 +1,5 @@
 // REQUIRES: aspect-ext_intel_legacy_image
-// UNSUPPORTED: hip
+// UNSUPPORTED: target-amd
 // RUN: %{build} -o %t.out
 // RUN: %{run} %t.out
 
@@ -12,7 +12,6 @@
 */
 
 #include "common.hpp"
-#include <sycl/sycl.hpp>
 
 using namespace sycl;
 

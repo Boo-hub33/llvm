@@ -1,18 +1,22 @@
-// REQUIRES: linux
-// REQUIRES: cuda
+// REQUIRES: aspect-ext_oneapi_bindless_images
+
+// UNSUPPORTED: hip || level_zero
+// UNSUPPORTED-INTENDED: Returning non-FP values from fetching fails on HIP.
+// Also, the feature is not fully implemented in the Level Zero stack.
 
 // RUN: %{build} -o %t.out
 // RUN: %{run} %t.out
 
-#include "user_types_common.hpp"
-#include <iostream>
-#include <sycl/sycl.hpp>
-
 // Uncomment to print additional test information
 // #define VERBOSE_PRINT
 
+#include "user_types_common.hpp"
+#include <iostream>
+#include <sycl/detail/core.hpp>
+
+#include <sycl/ext/oneapi/bindless_images.hpp>
+
 template <typename MyType, int NElems, typename OutType,
-          sycl::image_channel_order ChannelOrder,
           sycl::image_channel_type ChannelType, typename KernelName>
 bool run_test() {
 
@@ -46,8 +50,7 @@ bool run_test() {
         sycl::coordinate_normalization_mode::normalized,
         sycl::filtering_mode::linear);
 
-    syclexp::image_descriptor desc(sycl::range<2>{16, 16}, ChannelOrder,
-                                   ChannelType);
+    syclexp::image_descriptor desc(sycl::range<2>{16, 16}, NElems, ChannelType);
 
     syclexp::image_mem imgMemoryIn1(desc, q);
     syclexp::image_mem imgMemoryIn2(desc, q);
@@ -65,27 +68,35 @@ bool run_test() {
     q.wait_and_throw();
 
     q.submit([&](sycl::handler &cgh) {
-      cgh.parallel_for<KernelName>(sycl::range{16, 16}, [=](sycl::id<2> id) {
-        sycl::int2 coords = sycl::int2(id[0], id[1]);
-        sycl::float2 floatCoords =
-            sycl::float2(float(id[0]) + 0.5f, float(id[1]) + 0.5f);
+      cgh.parallel_for<KernelName>(
+          sycl::nd_range<2>{{16, 16}, {16, 16}}, [=](sycl::nd_item<2> it) {
+            size_t dim0 = it.get_local_id(0);
+            size_t dim1 = it.get_local_id(1);
+            sycl::int2 coords = sycl::int2(dim0, dim1);
+            sycl::float2 floatCoords =
+                sycl::float2(float(dim0) + 0.5f, float(dim1) + 0.5f);
 
-        MyType myPixel{};
+            MyType myPixel{};
 
-        // Unsampled read
-        myPixel = syclexp::read_image<MyType, OutType>(unsampledImgIn, coords);
+            // Unsampled fetch
+            myPixel =
+                syclexp::fetch_image<MyType, OutType>(unsampledImgIn, coords);
 
-        // Sampled read
-        myPixel +=
-            syclexp::read_image<MyType, OutType>(sampledImgIn, floatCoords);
+            // Sampled read
+            myPixel += syclexp::sample_image<MyType, OutType>(sampledImgIn,
+                                                              floatCoords);
 
-        syclexp::write_image(imgOut, coords, myPixel);
-      });
+            syclexp::write_image(imgOut, coords, myPixel);
+          });
     });
     q.wait_and_throw();
 
     q.ext_oneapi_copy(imgMemoryOut.get_handle(), dataOut, desc);
     q.wait_and_throw();
+
+    syclexp::destroy_image_handle(unsampledImgIn, q);
+    syclexp::destroy_image_handle(sampledImgIn, q);
+    syclexp::destroy_image_handle(imgOut, q);
   } catch (sycl::exception e) {
     std::cout << "SYCL exception caught: " << e.what() << "\n";
     return false;
@@ -127,56 +138,46 @@ int main() {
   // User-defined float structs
   printTestName("Running my_float4");
   validated &= run_test<my_float4, 4, sycl::vec<float, 4>,
-                        sycl::image_channel_order::rgba,
                         sycl::image_channel_type::fp32, class myfloat_4>();
   printTestName("Running my_float2");
-  validated &=
-      run_test<my_float2, 2, sycl::vec<float, 2>, sycl::image_channel_order::rg,
-               sycl::image_channel_type::fp32, class myfloat_2>();
+  validated &= run_test<my_float2, 2, sycl::vec<float, 2>,
+                        sycl::image_channel_type::fp32, class myfloat_2>();
 
   // User-defined uint structs
   printTestName("Running my_uint4");
   validated &=
       run_test<my_uint4, 4, sycl::vec<uint32_t, 4>,
-               sycl::image_channel_order::rgba,
                sycl::image_channel_type::unsigned_int32, class myuint_4>();
   printTestName("Running my_uint2");
   validated &=
       run_test<my_uint2, 2, sycl::vec<uint32_t, 2>,
-               sycl::image_channel_order::rg,
                sycl::image_channel_type::unsigned_int32, class myuint_2>();
 
-  printTestName("Running my_short4");
+  printTestName("Running my_ushort4");
   validated &=
       run_test<my_ushort4, 4, sycl::vec<uint16_t, 4>,
-               sycl::image_channel_order::rgba,
                sycl::image_channel_type::unsigned_int16, class myushort_4>();
 
-  printTestName("Running my_short2");
+  printTestName("Running my_ushort2");
   validated &=
       run_test<my_ushort2, 2, sycl::vec<uint16_t, 2>,
-               sycl::image_channel_order::rg,
                sycl::image_channel_type::unsigned_int16, class myushort_2>();
 
-  printTestName("Running my_char4");
+  printTestName("Running my_uchar4");
   validated &=
       run_test<my_uchar4, 4, sycl::vec<uint8_t, 4>,
-               sycl::image_channel_order::rgba,
                sycl::image_channel_type::unsigned_int8, class myuchar_4>();
-  printTestName("Running my_char2");
+  printTestName("Running my_uchar2");
   validated &=
       run_test<my_uchar2, 2, sycl::vec<uint8_t, 2>,
-               sycl::image_channel_order::rg,
                sycl::image_channel_type::unsigned_int8, class myuchar_2>();
 
   // User-defined sycl::half structs
   printTestName("Running my_half4");
   validated &= run_test<my_half4, 4, sycl::vec<sycl::half, 4>,
-                        sycl::image_channel_order::rgba,
                         sycl::image_channel_type::fp16, class myhalf_4>();
   printTestName("Running my_half2");
   validated &= run_test<my_half2, 2, sycl::vec<sycl::half, 2>,
-                        sycl::image_channel_order::rg,
                         sycl::image_channel_type::fp16, class myhalf_2>();
 
   if (validated) {

@@ -645,8 +645,9 @@ public:
   /// mask pointers.
   static bool clobbersPhysReg(const uint32_t *RegMask, MCRegister PhysReg) {
     // See TargetRegisterInfo.h.
-    assert(PhysReg < (1u << 30) && "Not a physical register");
-    return !(RegMask[PhysReg / 32] & (1u << PhysReg % 32));
+    assert((!PhysReg.isValid() || PhysReg.isPhysical()) &&
+           "Not a physical register");
+    return !(RegMask[PhysReg.id() / 32] & (1u << PhysReg.id() % 32));
   }
 
   /// clobbersPhysReg - Returns true if this RegMask operand clobbers PhysReg.
@@ -780,6 +781,10 @@ public:
 
   /// ChangeToGA - Replace this operand with a new global address operand.
   void ChangeToGA(const GlobalValue *GV, int64_t Offset,
+                  unsigned TargetFlags = 0);
+
+  /// ChangeToBA - Replace this operand with a new block address operand.
+  void ChangeToBA(const BlockAddress *BA, int64_t Offset,
                   unsigned TargetFlags = 0);
 
   /// ChangeToMCSymbol - Replace this operand with a new MC symbol operand.

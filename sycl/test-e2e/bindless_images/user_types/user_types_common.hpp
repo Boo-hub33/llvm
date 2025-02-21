@@ -1,10 +1,15 @@
 // This file includes common definitions and functions that are shared between
 // multiple tests that use user-defined types
 
+#ifdef VERBOSE_PRINT
 #include <iostream>
-#include <sycl/sycl.hpp>
+#endif
+#include <string>
+#include <sycl/detail/core.hpp>
 
-void printTestName(std::string name) {
+#include <sycl/ext/oneapi/bindless_images.hpp>
+
+static inline void printTestName([[maybe_unused]] std::string name) {
 #ifdef VERBOSE_PRINT
   std::cout << name << std::endl;
 #endif

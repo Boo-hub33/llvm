@@ -93,9 +93,8 @@ static void Parse_ODS_Device(ods_target &Target,
   std::string_view TopDeviceStr = DeviceSubTuple[0];
 
   // Handle explicit device type (e.g. 'gpu').
-  auto DeviceTypeMap =
-      getSyclDeviceTypeMap(); // <-- std::array<std::pair<std::string,
-                              // info::device::type>>
+  auto DeviceTypeMap = getSyclDeviceTypeMap();
+
   auto It =
       std::find_if(std::begin(DeviceTypeMap), std::end(DeviceTypeMap),
                    [&](auto DtPair) { return TopDeviceStr == DtPair.first; });
@@ -202,6 +201,8 @@ Parse_ONEAPI_DEVICE_SELECTOR(const std::string &envString) {
     std::vector<std::string_view> Pair =
         tokenize(Entry, ":", true /* ProhibitEmptyTokens */);
 
+    // Error handling. ONEAPI_DEVICE_SELECTOR terms should be in the
+    // format: <backend>:<devices>.
     if (Pair.empty()) {
       std::stringstream ss;
       ss << "Incomplete selector! Backend and device must be specified.";
@@ -211,8 +212,24 @@ Parse_ONEAPI_DEVICE_SELECTOR(const std::string &envString) {
       ss << "Incomplete selector!  Try '" << Pair[0]
          << ":*' if all devices under the backend was original intention.";
       throw sycl::exception(sycl::make_error_code(errc::invalid), ss.str());
-    } else if (Pair.size() == 2) {
-      backend be = Parse_ODS_Backend(Pair[0], Entry); // Pair[0] is backend.
+    } else if (Pair.size() > 2) {
+      std::stringstream ss;
+      ss << "Error parsing selector string \"" << Entry
+         << "\"  Too many colons (:)";
+      throw sycl::exception(sycl::make_error_code(errc::invalid), ss.str());
+    }
+
+    // Parse ONEAPI_DEVICE_SELECTOR terms for Pair.size() == 2.
+    else {
+
+      // Remove `!` from input backend string if it is present.
+      std::string_view input_be = Pair[0];
+      if (Pair[0][0] == '!')
+        input_be = Pair[0].substr(1);
+
+      backend be = Parse_ODS_Backend(input_be, Entry);
+
+      // For each backend, we can have multiple targets, seperated by ','.
       std::vector<std::string_view> Targets = tokenize(Pair[1], ",");
       for (auto TargetStr : Targets) {
         ods_target DeviceTarget(be);
@@ -234,11 +251,6 @@ Parse_ONEAPI_DEVICE_SELECTOR(const std::string &envString) {
         Parse_ODS_Device(DeviceTarget, TargetStr);
         Result.push_back(DeviceTarget);
       }
-    } else if (Pair.size() > 2) {
-      std::stringstream ss;
-      ss << "Error parsing selector string \"" << Entry
-         << "\"  Too many colons (:)";
-      throw sycl::exception(sycl::make_error_code(errc::invalid), ss.str());
     }
   }
 
@@ -288,145 +300,17 @@ ods_target_list::ods_target_list(const std::string &envStr) {
   TargetList = Parse_ONEAPI_DEVICE_SELECTOR(envStr);
 }
 
-// Backend is compatible with the SYCL_DEVICE_FILTER in the following cases.
+// Backend is compatible with the ONEAPI_DEVICE_SELECTOR in the following cases.
 // 1. Filter backend is '*' which means ANY backend.
 // 2. Filter backend match exactly with the given 'Backend'
 bool ods_target_list::backendCompatible(backend Backend) {
 
-  bool isESIMD = Backend == backend::ext_intel_esimd_emulator;
   return std::any_of(
       TargetList.begin(), TargetList.end(), [&](ods_target &Target) {
         backend TargetBackend = Target.Backend.value_or(backend::all);
-        return (TargetBackend == Backend) ||
-               (TargetBackend == backend::all && !isESIMD);
+        return (TargetBackend == Backend) || (TargetBackend == backend::all);
       });
 }
-
-// ---------------------------------------
-// SYCL_DEVICE_FILTER support
-
-device_filter::device_filter(const std::string &FilterString) {
-  std::vector<std::string_view> Tokens = tokenize(FilterString, ":");
-  size_t TripleValueID = 0;
-
-  auto FindElement = [&](auto Element) {
-    return std::string::npos != Tokens[TripleValueID].find(Element.first);
-  };
-
-  // Handle the optional 1st field of the filter, backend
-  // Check if the first entry matches with a known backend type
-  auto It = std::find_if(std::begin(getSyclBeMap()), std::end(getSyclBeMap()),
-                         FindElement);
-  // If no match is found, set the backend type backend::all
-  // which actually means 'any backend' will be a match.
-  if (It == getSyclBeMap().end())
-    Backend = backend::all;
-  else {
-    Backend = It->second;
-    TripleValueID++;
-
-    if (Backend == backend::host)
-      std::cerr << "WARNING: The 'host' backend type is no longer supported in "
-                   "device filter."
-                << std::endl;
-  }
-
-  // Handle the optional 2nd field of the filter - device type.
-  // Check if the 2nd entry matches with any known device type.
-  if (TripleValueID >= Tokens.size()) {
-    DeviceType = info::device_type::all;
-  } else {
-    auto Iter = std::find_if(std::begin(getSyclDeviceTypeMap()),
-                             std::end(getSyclDeviceTypeMap()), FindElement);
-    // If no match is found, set device_type 'all',
-    // which actually means 'any device_type' will be a match.
-    if (Iter == getSyclDeviceTypeMap().end())
-      DeviceType = info::device_type::all;
-    else {
-      DeviceType = Iter->second;
-      TripleValueID++;
-
-      if (DeviceType == info::device_type::host)
-        std::cerr << "WARNING: The 'host' device type is no longer supported "
-                     "in device filter."
-                  << std::endl;
-    }
-  }
-
-  // Handle the optional 3rd field of the filter, device number
-  // Try to convert the remaining string to an integer.
-  // If succeessful, the converted integer is the desired device num.
-  if (TripleValueID < Tokens.size()) {
-    try {
-      DeviceNum = std::stoi(Tokens[TripleValueID].data());
-    } catch (...) {
-      std::string Message =
-          std::string("Invalid device filter: ") + FilterString +
-          "\nPossible backend values are "
-          "{opencl,level_zero,cuda,hip,esimd_emulator,*}.\n"
-          "Possible device types are {cpu,gpu,acc,*}.\n"
-          "Device number should be an non-negative integer.\n";
-      throw sycl::invalid_parameter_error(Message, PI_ERROR_INVALID_VALUE);
-    }
-  }
-}
-
-device_filter_list::device_filter_list(const std::string &FilterStr) {
-  // First, change the string in all lowercase.
-  // This means we allow the user to use both uppercase and lowercase strings.
-  std::string FilterString = FilterStr;
-  std::transform(FilterString.begin(), FilterString.end(), FilterString.begin(),
-                 ::tolower);
-  // SYCL_DEVICE_FILTER can set multiple filters separated by commas.
-  // convert each filter triple string into an istance of device_filter class.
-  size_t Pos = 0;
-  while (Pos < FilterString.size()) {
-    size_t CommaPos = FilterString.find(",", Pos);
-    if (CommaPos == std::string::npos) {
-      CommaPos = FilterString.size();
-    }
-    std::string SubString = FilterString.substr(Pos, CommaPos - Pos);
-    FilterList.push_back(device_filter(SubString));
-    Pos = CommaPos + 1;
-  }
-}
-
-device_filter_list::device_filter_list(device_filter &Filter) {
-  FilterList.push_back(Filter);
-}
-
-void device_filter_list::addFilter(device_filter &Filter) {
-  FilterList.push_back(Filter);
-}
-
-// Backend is compatible with the SYCL_DEVICE_FILTER in the following cases.
-// 1. Filter backend is '*' which means ANY backend.
-// 2. Filter backend match exactly with the given 'Backend'
-bool device_filter_list::backendCompatible(backend Backend) {
-  return std::any_of(
-      FilterList.begin(), FilterList.end(), [&](device_filter &Filter) {
-        backend FilterBackend = Filter.Backend.value_or(backend::all);
-        return (FilterBackend == Backend) || (FilterBackend == backend::all);
-      });
-}
-
-bool device_filter_list::deviceTypeCompatible(info::device_type DeviceType) {
-  return std::any_of(FilterList.begin(), FilterList.end(),
-                     [&](device_filter &Filter) {
-                       info::device_type FilterDevType =
-                           Filter.DeviceType.value_or(info::device_type::all);
-                       return (FilterDevType == DeviceType) ||
-                              (FilterDevType == info::device_type::all);
-                     });
-}
-
-bool device_filter_list::deviceNumberCompatible(int DeviceNum) {
-  return std::any_of(
-      FilterList.begin(), FilterList.end(), [&](device_filter &Filter) {
-        return (!Filter.DeviceNum) || (Filter.DeviceNum.value() == DeviceNum);
-      });
-}
-
 } // namespace detail
 } // namespace _V1
 } // namespace sycl

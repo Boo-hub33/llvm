@@ -7,6 +7,7 @@
 # ===----------------------------------------------------------------------===##
 
 import lit
+import libcxx.test.config as config
 import lit.formats
 import os
 import re
@@ -28,7 +29,7 @@ def _getTempPaths(test):
 
 def _checkBaseSubstitutions(substitutions):
     substitutions = [s for (s, _) in substitutions]
-    for s in ["%{cxx}", "%{compile_flags}", "%{link_flags}", "%{flags}", "%{exec}"]:
+    for s in ["%{cxx}", "%{compile_flags}", "%{link_flags}", "%{benchmark_flags}", "%{flags}", "%{exec}"]:
         assert s in substitutions, "Required substitution {} was not provided".format(s)
 
 def _executeScriptInternal(test, litConfig, commands):
@@ -50,6 +51,14 @@ def _executeScriptInternal(test, litConfig, commands):
     (out, err, exitCode, timeoutInfo) = res
 
     return (out, err, exitCode, timeoutInfo, parsedCommands)
+
+
+def _validateModuleDependencies(modules):
+    for m in modules:
+        if m not in ("std", "std.compat"):
+            raise RuntimeError(
+                f"Invalid module dependency '{m}', only 'std' and 'std.compat' are valid"
+            )
 
 
 def parseScript(test, preamble):
@@ -91,6 +100,8 @@ def parseScript(test, preamble):
     # Parse the test file, including custom directives
     additionalCompileFlags = []
     fileDependencies = []
+    modules = []  # The enabled modules
+    moduleCompileFlags = []  # The compilation flags to use modules
     parsers = [
         lit.TestRunner.IntegratedTestKeywordParser(
             "FILE_DEPENDENCIES:",
@@ -101,6 +112,11 @@ def parseScript(test, preamble):
             "ADDITIONAL_COMPILE_FLAGS:",
             lit.TestRunner.ParserKind.SPACE_LIST,
             initial_value=additionalCompileFlags,
+        ),
+        lit.TestRunner.IntegratedTestKeywordParser(
+            "MODULE_DEPENDENCIES:",
+            lit.TestRunner.ParserKind.SPACE_LIST,
+            initial_value=modules,
         ),
     ]
 
@@ -132,12 +148,54 @@ def parseScript(test, preamble):
     script += scriptInTest
 
     # Add compile flags specified with ADDITIONAL_COMPILE_FLAGS.
-    substitutions = [
-        (s, x + " " + " ".join(additionalCompileFlags))
-        if s == "%{compile_flags}"
-        else (s, x)
-        for (s, x) in substitutions
-    ]
+    # Modules need to be built with the same compilation flags as the
+    # test. So add these flags before adding the modules.
+    substitutions = config._appendToSubstitution(
+        substitutions, "%{compile_flags}", " ".join(additionalCompileFlags)
+    )
+
+    if modules:
+        _validateModuleDependencies(modules)
+
+        # The moduleCompileFlags are added to the %{compile_flags}, but
+        # the modules need to be built without these flags. So expand the
+        # %{compile_flags} eagerly and hardcode them in the build script.
+        compileFlags = config._getSubstitution("%{compile_flags}", test.config)
+
+        # Building the modules needs to happen before the other script
+        # commands are executed. Therefore the commands are added to the
+        # front of the list.
+        if "std.compat" in modules:
+            script.insert(
+                0,
+                "%dbg(MODULE std.compat) %{cxx} %{flags} "
+                f"{compileFlags} "
+                "-Wno-reserved-module-identifier -Wno-reserved-user-defined-literal "
+                "-fmodule-file=std=%T/std.pcm " # The std.compat module imports std.
+                "--precompile -o %T/std.compat.pcm -c %{module-dir}/std.compat.cppm",
+            )
+            moduleCompileFlags.extend(
+                ["-fmodule-file=std.compat=%T/std.compat.pcm", "%T/std.compat.pcm"]
+            )
+
+        # Make sure the std module is built before std.compat. Libc++'s
+        # std.compat module depends on the std module. It is not
+        # known whether the compiler expects the modules in the order of
+        # their dependencies. However it's trivial to provide them in
+        # that order.
+        script.insert(
+            0,
+            "%dbg(MODULE std) %{cxx} %{flags} "
+            f"{compileFlags} "
+            "-Wno-reserved-module-identifier -Wno-reserved-user-defined-literal "
+            "--precompile -o %T/std.pcm -c %{module-dir}/std.cppm",
+        )
+        moduleCompileFlags.extend(["-fmodule-file=std=%T/std.pcm", "%T/std.pcm"])
+
+        # Add compile flags required for the modules.
+        substitutions = config._appendToSubstitution(
+            substitutions, "%{compile_flags}", " ".join(moduleCompileFlags)
+        )
 
     # Perform substitutions in the script itself.
     script = lit.TestRunner.applySubstitutions(
@@ -162,11 +220,15 @@ class CxxStandardLibraryTest(lit.formats.FileBasedTest):
     The test format operates by assuming that each test's configuration provides
     the following substitutions, which it will reuse in the shell scripts it
     constructs:
-        %{cxx}           - A command that can be used to invoke the compiler
-        %{compile_flags} - Flags to use when compiling a test case
-        %{link_flags}    - Flags to use when linking a test case
-        %{flags}         - Flags to use either when compiling or linking a test case
-        %{exec}          - A command to prefix the execution of executables
+        %{cxx}             - A command that can be used to invoke the compiler
+        %{compile_flags}   - Flags to use when compiling a test case
+        %{link_flags}      - Flags to use when linking a test case
+        %{flags}           - Flags to use either when compiling or linking a test case
+        %{benchmark_flags} - Flags to use when compiling benchmarks. These flags should provide access to
+                             GoogleBenchmark but shouldn't hardcode any optimization level or other settings,
+                             since the benchmarks should be run under the same configuration as the rest of
+                             the test suite.
+        %{exec}            - A command to prefix the execution of executables
 
     Note that when building an executable (as opposed to only compiling a source
     file), all three of %{flags}, %{compile_flags} and %{link_flags} will be used
@@ -196,6 +258,7 @@ class CxxStandardLibraryTest(lit.formats.FileBasedTest):
 
     def getTestsForPath(self, testSuite, pathInSuite, litConfig, localConfig):
         SUPPORTED_SUFFIXES = [
+            "[.]bench[.]cpp$",
             "[.]pass[.]cpp$",
             "[.]pass[.]mm$",
             "[.]compile[.]pass[.]cpp$",
@@ -207,7 +270,6 @@ class CxxStandardLibraryTest(lit.formats.FileBasedTest):
             "[.]sh[.][^.]+$",
             "[.]gen[.][^.]+$",
             "[.]verify[.]cpp$",
-            "[.]fail[.]cpp$",
         ]
 
         sourcePath = testSuite.getSourcePath(pathInSuite)
@@ -273,6 +335,20 @@ class CxxStandardLibraryTest(lit.formats.FileBasedTest):
                 "%dbg(COMPILED WITH) %{cxx} %s %{flags} %{compile_flags} %{link_flags} -o %t.exe",
                 "%dbg(EXECUTED AS) %{exec} %t.exe",
             ]
+            return self._executeShTest(test, litConfig, steps)
+        elif filename.endswith(".bench.cpp"):
+            if "enable-benchmarks=no" in test.config.available_features:
+                return lit.Test.Result(
+                    lit.Test.UNSUPPORTED,
+                    "Test {} requires support for benchmarks, which isn't supported by this configuration".format(
+                        test.getFullName()
+                    ),
+                )
+            steps = [
+                "%dbg(COMPILED WITH) %{cxx} %s %{flags} %{compile_flags} %{benchmark_flags} %{link_flags} -o %t.exe",
+            ]
+            if "enable-benchmarks=run" in test.config.available_features:
+                steps += ["%dbg(EXECUTED AS) %{exec} %t.exe --benchmark_out=%T/benchmark-result.json --benchmark_out_format=json"]
             return self._executeShTest(test, litConfig, steps)
         else:
             return lit.Test.Result(

@@ -1,13 +1,19 @@
 // REQUIRES: linux
 
-// https://github.com/intel/llvm/issues/7634
 // UNSUPPORTED: hip
+// UNSUPPORTED-TRACKER: https://github.com/intel/llvm/issues/7634
 //
-// FIXME: Remove XFAIL one intel/llvm#11364 is resolved
+// UNSUPPORTED: cuda
+// UNSUPPORTED-TRACKER: https://github.com/intel/llvm/issues/8832
+//
 // XFAIL: (opencl && gpu)
+// XFAIL-TRACKER: https://github.com/intel/llvm/issues/11364
+
+// Test requires at least this version of the Intel GPU driver on Arc.
+// REQUIRES-INTEL-DRIVER: lin: 31294
 
 // RUN: %{build} -DSYCL_FALLBACK_ASSERT=1 -I %S/Inputs %S/Inputs/kernels_in_file2.cpp -o %t.out
-// RUN: %{run} %t.out &> %t.txt ; FileCheck %s --input-file %t.txt %if acc %{ --check-prefix=CHECK-ACC %}
+// RUN: %{run} %t.out &> %t.txt ; FileCheck %s --input-file %t.txt %if fpga %{ --check-prefix=CHECK-ACC %}
 // Shouldn't fail on ACC as fallback assert isn't enqueued there
 //
 // CUDA uses block/thread vs global/local id for SYCL, also it shows the

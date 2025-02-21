@@ -17,6 +17,7 @@
 #include <sycl/ext/oneapi/properties/properties.hpp>
 #include <sycl/ext/oneapi/properties/property.hpp>
 #include <sycl/ext/oneapi/properties/property_value.hpp>
+#include <sycl/pointers.hpp>
 
 #include <cstddef>
 #include <string_view>
@@ -30,35 +31,6 @@ inline namespace _V1 {
 namespace ext {
 namespace oneapi {
 namespace experimental {
-
-namespace {
-// compare strings on compile time
-constexpr bool compareStrs(const char *Str1, const char *Str2) {
-  return std::string_view(Str1) == Str2;
-}
-
-// filter properties with AllowedPropsTuple via name checking
-template <typename TestProps, typename AllowedPropsTuple>
-struct PropertiesAreAllowed {};
-
-template <typename TestProps, typename... AllowedProps>
-struct PropertiesAreAllowed<TestProps, std::tuple<const AllowedProps...>> {
-  static constexpr const bool allowed =
-      (compareStrs(detail::PropertyMetaInfo<TestProps>::name,
-                   detail::PropertyMetaInfo<AllowedProps>::name) ||
-       ...);
-};
-
-template <typename... Ts>
-using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
-
-template <typename AllowedPropTuple, typename... Props>
-struct PropertiesFilter {
-  using tuple = tuple_cat_t<typename std::conditional<
-      PropertiesAreAllowed<Props, AllowedPropTuple>::allowed, std::tuple<Props>,
-      std::tuple<>>::type...>;
-};
-} // namespace
 
 template <typename T, typename PropertyListT = empty_properties_t>
 class annotated_ref {
@@ -77,7 +49,36 @@ struct is_ann_ref_impl<const annotated_ref<T, P>> : std::true_type {};
 template <class T>
 constexpr bool is_ann_ref_v =
     is_ann_ref_impl<std::remove_reference_t<T>>::value;
+
+// filter properties that are applied on annotations
+template <typename PropertyListTy>
+using annotation_filter = decltype(filter_properties<propagateToPtrAnnotation>(
+    std::declval<PropertyListTy>()));
 } // namespace detail
+
+template <typename I, typename P> struct annotationHelper {};
+
+// unpack properties to varadic template
+template <typename I, typename... P>
+struct annotationHelper<I, detail::properties_t<P...>> {
+  static I *annotate(I *ptr) {
+    return __builtin_intel_sycl_ptr_annotation(
+        ptr, detail::PropertyMetaInfo<P>::name...,
+        detail::PropertyMetaInfo<P>::value...);
+  }
+
+  static I load(I *ptr) {
+    return *__builtin_intel_sycl_ptr_annotation(
+        ptr, detail::PropertyMetaInfo<P>::name...,
+        detail::PropertyMetaInfo<P>::value...);
+  }
+
+  template <class O> static I store(I *ptr, O &&Obj) {
+    return *__builtin_intel_sycl_ptr_annotation(
+               ptr, detail::PropertyMetaInfo<P>::name...,
+               detail::PropertyMetaInfo<P>::value...) = std::forward<O>(Obj);
+  }
+};
 
 template <typename T, typename... Props>
 class annotated_ref<T, detail::properties_t<Props...>> {
@@ -97,9 +98,8 @@ public:
   // implicit conversion with annotaion
   operator T() const {
 #ifdef __SYCL_DEVICE_ONLY__
-    return *__builtin_intel_sycl_ptr_annotation(
-        m_Ptr, detail::PropertyMetaInfo<Props>::name...,
-        detail::PropertyMetaInfo<Props>::value...);
+    return annotationHelper<
+        T, detail::annotation_filter<property_list_t>>::load(m_Ptr);
 #else
     return *m_Ptr;
 #endif
@@ -109,10 +109,8 @@ public:
   template <class O, typename = std::enable_if_t<!detail::is_ann_ref_v<O>>>
   T operator=(O &&Obj) const {
 #ifdef __SYCL_DEVICE_ONLY__
-    return *__builtin_intel_sycl_ptr_annotation(
-               m_Ptr, detail::PropertyMetaInfo<Props>::name...,
-               detail::PropertyMetaInfo<Props>::value...) =
-               std::forward<O>(Obj);
+    return annotationHelper<
+        T, detail::annotation_filter<property_list_t>>::store(m_Ptr, Obj);
 #else
     return *m_Ptr = std::forward<O>(Obj);
 #endif
@@ -238,7 +236,7 @@ annotated_ptr(T *, Args...)
     -> annotated_ptr<T, typename detail::DeducedProperties<Args...>::type>;
 
 template <typename T, typename old, typename... ArgT>
-annotated_ptr(annotated_ptr<T, old>, properties<std::tuple<ArgT...>>)
+annotated_ptr(annotated_ptr<T, old>, detail::properties_t<ArgT...>)
     -> annotated_ptr<
         T, detail::merged_properties_t<old, detail::properties_t<ArgT...>>>;
 #endif // __cpp_deduction_guides
@@ -254,43 +252,17 @@ class annotated_ptr {
 template <typename T, typename... Props>
 class __SYCL_SPECIAL_CLASS
 __SYCL_TYPE(annotated_ptr) annotated_ptr<T, detail::properties_t<Props...>> {
-  using property_list_t = detail::properties_t<Props...>;
 
   static_assert(std::is_same_v<T, void> || std::is_trivially_copyable_v<T>,
                 "annotated_ptr can only encapsulate either "
                 "a trivially-copyable type "
                 "or void!");
 
-  // buffer_location and alignment are allowed for annotated_ref
-  // Cache controls are allowed for annotated_ptr
-  using allowed_properties =
-      std::tuple<decltype(ext::intel::experimental::buffer_location<0>),
-                 decltype(ext::oneapi::experimental::alignment<0>),
-                 decltype(ext::intel::experimental::read_hint<
-                          ext::intel::experimental::cache_control<
-                              ext::intel::experimental::cache_mode::cached,
-                              cache_level::L1>>),
-                 decltype(ext::intel::experimental::read_assertion<
-                          ext::intel::experimental::cache_control<
-                              ext::intel::experimental::cache_mode::cached,
-                              cache_level::L1>>),
-                 decltype(ext::intel::experimental::write_hint<
-                          ext::intel::experimental::cache_control<
-                              ext::intel::experimental::cache_mode::cached,
-                              cache_level::L1>>)>;
-  using filtered_properties =
-      typename PropertiesFilter<allowed_properties, Props...>::tuple;
+  using property_list_t = detail::properties_t<Props...>;
 
-  // template unpack helper
-  template <typename... FilteredProps> struct unpack {};
-
-  template <typename... FilteredProps>
-  struct unpack<std::tuple<FilteredProps...>> {
-    using type = detail::properties_t<FilteredProps...>;
-  };
-
-  using reference = sycl::ext::oneapi::experimental::annotated_ref<
-      T, typename unpack<filtered_properties>::type>;
+  // annotated_ref type
+  using reference =
+      sycl::ext::oneapi::experimental::annotated_ref<T, property_list_t>;
 
 #ifdef __ENABLE_USM_ADDR_SPACE__
   using global_pointer_t = std::conditional_t<
@@ -322,7 +294,7 @@ public:
   annotated_ptr &operator=(const annotated_ptr &) = default;
 
   explicit annotated_ptr(T *Ptr,
-                         const property_list_t & = properties{}) noexcept
+                         const property_list_t & = property_list_t{}) noexcept
       : m_Ptr(Ptr) {}
 
   // Constructs an annotated_ptr object from a raw pointer and variadic
@@ -392,14 +364,6 @@ public:
 
   reference operator*() const noexcept { return reference(m_Ptr); }
 
-  reference operator[](std::ptrdiff_t idx) const noexcept {
-    return reference(m_Ptr + idx);
-  }
-
-  annotated_ptr operator+(size_t offset) const noexcept {
-    return annotated_ptr<T, property_list_t>(m_Ptr + offset);
-  }
-
   std::ptrdiff_t operator-(annotated_ptr other) const noexcept {
     return m_Ptr - other.m_Ptr;
   }
@@ -408,29 +372,88 @@ public:
 
   operator T *() const noexcept = delete;
 
-  T *get() const noexcept { return m_Ptr; }
+  T *get() const noexcept {
+#ifdef __SYCL_DEVICE_ONLY__
+    return annotationHelper<
+        T, detail::annotation_filter<property_list_t>>::annotate(m_Ptr);
+#else
+    return m_Ptr;
+#endif
+  }
 
+  // When the properties contain alignment, operator '[]', '+', '++' and '--'
+  // (both post- and prefix) are disabled. Calling these operators when
+  // alignment is present causes a compile error. Note that clang format is
+  // turned off for these operators to make sure the complete error notes are
+  // printed
+  // clang-format off
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<!has_alignment>>
+  reference operator[](std::ptrdiff_t idx) const noexcept {
+    return reference(m_Ptr + idx);
+  }
+
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<has_alignment>>
+  auto operator[](std::ptrdiff_t idx) const noexcept -> decltype("operator[] is not available when alignment is specified!") = delete;
+
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<!has_alignment>>
+  annotated_ptr operator+(size_t offset) const noexcept {
+    return annotated_ptr(m_Ptr + offset);
+  }
+
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<has_alignment>>
+  auto operator+(size_t offset) const noexcept -> decltype("operator+ is not available when alignment is specified!") = delete;
+
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<!has_alignment>>
   annotated_ptr &operator++() noexcept {
     m_Ptr += 1;
     return *this;
   }
 
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<has_alignment>>
+  auto operator++() noexcept -> decltype("operator++ is not available when alignment is specified!") = delete;
+
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<!has_alignment>>
   annotated_ptr operator++(int) noexcept {
     auto tmp = *this;
     m_Ptr += 1;
     return tmp;
   }
 
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<has_alignment>>
+  auto operator++(int) noexcept -> decltype("operator++ is not available when alignment is specified!") = delete;
+
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<!has_alignment>>
   annotated_ptr &operator--() noexcept {
     m_Ptr -= 1;
     return *this;
   }
 
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<has_alignment>>
+  auto operator--() noexcept -> decltype("operator-- is not available when alignment is specified!") = delete;
+
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<!has_alignment>>
   annotated_ptr operator--(int) noexcept {
     auto tmp = *this;
     m_Ptr -= 1;
     return tmp;
   }
+
+  template <bool has_alignment = property_list_t::template has_property<alignment_key>(),
+            class = std::enable_if_t<has_alignment>>
+  auto operator--(int) noexcept -> decltype("operator-- is not available when alignment is specified!") = delete;
+
+  // clang-format on
 
   template <typename PropertyT> static constexpr bool has_property() {
     return property_list_t::template has_property<PropertyT>();
@@ -457,13 +480,13 @@ public:
                 "The property list contains invalid property.");
   // check the set if FPGA specificed properties are used
   static constexpr bool hasValidFPGAProperties =
-      detail::checkValidFPGAPropertySet<Props...>::value;
+      detail::checkValidFPGAPropertySet<property_list_t>::value;
   static_assert(hasValidFPGAProperties,
                 "FPGA Interface properties (i.e. awidth, dwidth, etc.) "
                 "can only be set with BufferLocation together.");
   // check if conduit and register_map properties are specified together
   static constexpr bool hasConduitAndRegisterMapProperties =
-      detail::checkHasConduitAndRegisterMap<Props...>::value;
+      detail::checkHasConduitAndRegisterMap<property_list_t>::value;
   static_assert(hasConduitAndRegisterMapProperties,
                 "The properties conduit and register_map cannot be "
                 "specified at the same time.");
